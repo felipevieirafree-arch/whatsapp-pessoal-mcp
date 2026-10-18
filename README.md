@@ -2,7 +2,7 @@
 
 Let your AI agent read your WhatsApp messages.
 
-This is a small server that runs in your own Cloudflare account. You link your phone to it once, the way you'd link WhatsApp Web, and from then on any MCP client (Claude Code, Claude Desktop, anything that speaks MCP) can search and read your chats. It is read-only. It can't send anything.
+This is a small server that runs in your own Cloudflare account. You link your phone to it once, the way you'd link WhatsApp Web, and from then on any MCP client (Claude Code, Claude Desktop, anything that speaks MCP) can search and read your chats. It can read and search your messages, and remember names you give it for phone numbers. It can't send anything.
 
 Ask your agent things like:
 
@@ -50,25 +50,6 @@ Wrangler prints your URL, something like `https://whatsapp-mcp.your-name.workers
 
 If you want your own domain, see the comments at the bottom of `wrangler.jsonc`.
 
-### Sign in with Google, and get names for your chats
-
-A password is the simplest way in. Google sign-in is better if you want your contacts' names on chats, because the same login also lets the server read your Google contacts (read-only). You need a Google Cloud project of your own:
-
-1. Create a project and enable the **People API**.
-2. Under Google Auth Platform, create an **OAuth client** of type "Web application". Add `https://your-domain/callback/google` as an authorized redirect URI. It has to be a domain you control, not a `localhost` address.
-3. Add the scopes `contacts.readonly` and `contacts.other.readonly`. Add yourself as a test user.
-4. Fill in the consent screen's links: app home page `https://your-domain/`, privacy policy `https://your-domain/privacy` and terms of service `https://your-domain/tos`. The server serves both, written to match what it does; if you change what it stores or who can use it, edit `src/privacy.ts` and `src/tos.ts` too. Neither is legal advice. Then **publish the app** ("In production"). Google shows a warning that it isn't verified, which is fine for a single user. If you leave it in "Testing", Google expires the contacts access after 7 days and names stop updating.
-5. Give the Worker the client and your email:
-
-   ```sh
-   npx wrangler secret put GOOGLE_CLIENT_ID
-   npx wrangler secret put GOOGLE_CLIENT_SECRET
-   ```
-
-   and in `wrangler.jsonc` add `"vars": { "OWNER_EMAIL": "you@gmail.com", "DEFAULT_COUNTRY_CODE": "1" }`. The country code (digits, no plus) is only used for numbers in your contacts that Google can't place on its own.
-
-Then open `/setup` and sign in. Contacts refresh on every sign-in, on the daily pull, and when your agent calls `sync_now`.
-
 ### The Workers Paid note
 
 Importing a large history decodes a lot of data in one go, and the default CPU limit on Workers is too small for it. `wrangler.jsonc` raises it, and raising it needs the paid plan, which is a few dollars a month. I haven't tried the free plan. If you're on it, remove the `limits` block and expect the first import to be fragile.
@@ -79,7 +60,7 @@ Importing a large history decodes a lot of data in one go, and the default CPU l
 
 **You get what WhatsApp sends.** The first link imports whatever history WhatsApp decides to hand a new device. It may not be everything. It only does this once per link. To import again, relink (your stored messages are kept, and a re-import fills in anything missing).
 
-**Some chats show up as phone numbers.** WhatsApp doesn't give a linked device every contact name. Chats with people it has no name for show as a number. If you sign in with Google (see below), the server reads your Google contacts and matches them to chats by phone number, which fills most of these in.
+**Some chats show up as phone numbers.** WhatsApp doesn't give a linked device every contact name, and most of these are one-off messages from people you never saved. For the ones that matter, your agent can fix it: it lists the unnamed chats, looks the numbers up in your contacts with whatever contacts tool it already has (a Google Contacts or Gmail connector, for example), and saves the names. The server never connects to a contacts service itself. See "Naming chats" below.
 
 **Media isn't downloaded.** Photos, voice notes and documents appear as labels like `[image]` or `[voice note 12s]`, with the caption if there was one. Nothing is transcribed.
 
@@ -94,11 +75,21 @@ Importing a large history decodes a lot of data in one go, and the default CPU l
 | `list_chats` | Chats, most recent first. Filter by name or number. |
 | `get_messages` | Read one chat. Page back or forward by date. |
 | `search_messages` | Full-text search across everything, or within one chat. |
+| `unnamed_chats` | Chats known only by phone number, busiest first, with the last thing the other person said. |
+| `set_contact_names` | Save names for phone numbers, in any format. Names stick to the number, so they also show up in groups. |
 | `sync_now` | Pull new messages right now. |
 | `link_status` | Is it linked, when did it last pull, how much is stored. |
 | `relink` | Unlink and start over. A human has to scan the new QR code. |
 
 Every read tool first tops up from WhatsApp if the stored copy is more than ten minutes old.
+
+## Naming chats
+
+WhatsApp only gives this server the names it knows. The rest show up as phone numbers. Rather than have the server log in to a contacts service (which means a cloud project, consent screens and, for Google, an app review), it hands the job to your agent, which usually already has a way to reach your contacts.
+
+Say "find names for my unnamed chats". The agent calls `unnamed_chats`, matches the numbers against your contacts, and saves what it finds with `set_contact_names`. It won't find everyone: most unnamed chats are a single message from a stranger.
+
+Agents get nudged toward this on their own. The server's instructions mention it, and so does every "no chat found" and "no matches" result, because that's the moment an agent is stuck on a name. `link_status` also says how many chats are unnamed.
 
 ---
 
@@ -130,12 +121,12 @@ One Durable Object holds everything. Its SQLite is both the Baileys auth store a
 | File | Job |
 | --- | --- |
 | `src/index.ts` | Routes. OAuth provider wiring, sign-in, pairing endpoints, `/debug`, cron. |
-| `src/auth.ts` | Who counts as the owner. Three modes: Google, a login service, or a password. |
-| `src/google.ts` | Google sign-in, token refresh, and reading contacts with phone-number normalization. |
+| `src/auth.ts` | Who counts as the owner. Two modes: a password, or a login service. Also the owner's browser session. |
+| `src/phone.ts` | Phone numbers in any format to WhatsApp jids. |
 | `src/whatsapp-do.ts` | The Durable Object. Runs Baileys sessions, exposes RPC methods for the Worker. |
 | `src/store.ts` | Schema, ingesting Baileys events into SQLite, and every query. |
 | `src/auth-state.ts` | Baileys auth state backed by the DO's SQLite (replaces `useMultiFileAuthState`). |
-| `src/mcp.ts` | The MCP tools. |
+| `src/mcp.ts` | The MCP tools, and the hint that points agents at the naming tools. |
 | `src/pages.ts`, `src/landing.ts`, `src/privacy.ts`, `src/tos.ts`, `src/ui.ts` | All HTML. `ui.ts` has the shared design tokens. |
 | `src/ws-shim.ts`, `src/lru-shim.ts`, `src/polyfills.ts` | Make Baileys run on workerd. See below. |
 | `scripts/vendor-bridge.mjs` | Extracts the wasm from Baileys' Rust bridge. Runs on `npm install`. |
@@ -160,7 +151,7 @@ All in the Durable Object's SQLite (`store.ts`, `initSchema`).
 
 - `messages(chat, id, ts, from_me, sender, push_name, type, body)`, primary key `(chat, id)`. Media is a label in `body`. Edits update `body`; deletes set it to `[deleted]`.
 - `messages_fts`, an FTS5 index over `body`, kept in sync by triggers.
-- `chats(jid, name, is_group)` and `contacts(jid, name, notify)`. Display names resolve by chat name, then contact name, then push name, then the number.
+- `chats(jid, name, is_group)`, `contacts(jid, name, notify)` and `custom_names(jid, name)`. Display names resolve by WhatsApp's chat name, then WhatsApp's contact name, then a saved name, then the person's own push name, then the number. `custom_names` is what `set_contact_names` writes.
 - `alias(lid, pn)`. WhatsApp is moving to anonymous `@lid` identifiers. This maps them to phone-number JIDs, and `addAlias` folds existing rows into the phone-number form so one person is one chat.
 - `auth(k, v)`, Baileys credentials and signal keys, JSON with Buffers encoded by Baileys' `BufferJSON`.
 - `meta(k, v)`, currently just `last_pull`.
@@ -182,17 +173,17 @@ These all cost real time to find. Read them before touching the Baileys parts.
 6. **Pin Baileys exactly.** It's a prerelease and its API moves between release candidates.
 7. **Deploys don't evict a busy Durable Object.** An object with an active session keeps running old code until the session ends. Renaming the class with a migration didn't evict it either. If you've shipped a fix and the object still misbehaves, stop sending it requests and wait three to five minutes. Every probe, including `/debug`, resets its idle timer, so polling a stale object keeps it stale. Baileys also leaks interval timers when a socket closes; `finish()` in `whatsapp-do.ts` clears them so the object can go idle at all.
 8. **Logging out takes two steps.** `logout()` first connects and calls Baileys' `logout()`, so the device disappears from the phone's list, then clears local credentials. If the first step fails it says so in the debug events, and the user has to remove the device by hand.
-9. **Don't call `markOnlineOnConnect`.** It's set to false on purpose. Marking the linked device online makes the phone stop showing notifications.
+9. **WhatsApp stores a placeholder where a name should be.** Chats it has no contact for are named after the number, sometimes masked (`+972∙∙∙∙∙∙∙20`), in the chat name and the contact name. `numberLike` in `store.ts` treats those as no name, and ingest refuses to store them. Before that fix a placeholder outranked a real saved name.
+10. **Don't call `markOnlineOnConnect`.** It's set to false on purpose. Marking the linked device online makes the phone stop showing notifications.
 
 ## Configuration
 
 | Name | Kind | Purpose |
 | --- | --- | --- |
 | `OWNER_PASSWORD` | secret | Password mode (default). 12+ characters or sign-in refuses. |
-| `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET` | secrets | Set these to switch to Google mode. Takes priority over the other two modes. |
-| `OWNER_EMAIL` | var | Google and login-service modes: the one email allowed in. |
+| `OWNER_EMAIL` | var | Login-service mode: the one email allowed in. |
 | `OPERATOR_NAME` | var, optional | Shown on the privacy page as who runs this server. |
-| `DEFAULT_COUNTRY_CODE` | var, optional | Google mode: country code for contact numbers Google can't place, e.g. `972`. |
+| `DEFAULT_COUNTRY_CODE` | var, optional | Country code (digits, no plus), used when your agent saves a number written without one, e.g. `972`. |
 | `LOGIN_ORIGIN` | var | Set this to switch to login-service mode. |
 | `ALLOWED_ORIGINS` | var | Login-service mode: comma-separated origins whose tokens are accepted. Production should list only production. |
 | `PIN` | secret, optional | 32+ random characters. Enables the `/debug` routes via an `x-pin` header. Leave it unset to leave them off. |
@@ -203,10 +194,10 @@ Keep a deployment's own values (domain, KV id, email) in `wrangler.local.jsonc`,
 
 ## Adapting it
 
-- **Add a tool.** Register it in `mcp.ts` and put the SQL in `store.ts`. Read tools should call `fresh()` first. Keep tools read-only unless you mean otherwise.
+- **Add a tool.** Register it in `mcp.ts` and put the SQL in `store.ts`. Read tools should call `fresh()` first. Keep tools read-only unless you mean otherwise. If a failure leaves an agent stuck, say in the tool result what to try next, the way `NAME_HINT` does for missing names.
 - **Change who can sign in.** `auth.ts` picks a mode (`authMode`) and the routes in `index.ts` follow it. To add another identity provider, add a mode there and a callback route. The rest of the code only sees an opaque bearer token.
 - **Make it multi-user.** Today the Durable Object is addressed by the fixed name `owner` (`wa()` in `index.ts`, `handleMcp` in `mcp.ts`), and `userId` is the constant `'owner'` in the OAuth props. To go multi-user, derive both from the signed-in identity and key the object on it. Think about whether you want to hold other people's message history first.
-- **Contacts from somewhere else.** `google.ts` fetches names and `store.replaceGoogleContacts` keeps them in their own table, keyed by WhatsApp jid. Name resolution prefers WhatsApp's chat name, then WhatsApp's contact name, then the Google name, then the person's own push name, then the number. Another source (a CSV, CardDAV) only needs to produce `{ jid, name }` rows.
+- **Other ways to fill in names.** Anything that can produce `{ jid, name }` rows can call `store.setCustomNames`. A CSV upload, a CardDAV pull or a scheduled job would all work. The agent route exists so the server needs no credentials for any of them.
 - **Sending messages.** Not built, on purpose. Think hard before adding it.
 
 ## Debugging
@@ -216,7 +207,8 @@ With `PIN` set, these return JSON and need the header `x-pin: <PIN>`:
 - `/debug`: session phase, linked or not, counts, and the last events from the session (connection changes, history chunk sizes, errors).
 - `/debug/pull`: run a pull now.
 - `/debug/chats?q=`, `/debug/messages?chat=`, `/debug/search?q=`, `/debug/types`: read the store without going through MCP.
-- `/debug/contacts`: Google contacts status. Add `?sync=1` to run a sync now.
+- `/debug/unnamed`: the chats `unnamed_chats` would return.
+- `/debug/sql?q=`: one read-only `SELECT` against the store, for finding out why a name or a count looks wrong.
 - `/debug/logout`: the same as `relink`.
 
 Local development: `npm run dev` with a `.dev.vars` containing `OWNER_PASSWORD=...` (12+ characters). It runs a local Durable Object with its own empty storage, so you can exercise the sign-in flow and see a real QR code, but linking a phone from local dev makes a second linked device.
@@ -225,16 +217,15 @@ To test the pairing UI states without a phone, serve the page with a mocked `/pa
 
 ## Checking a change
 
-1. `npm run typecheck`
+1. `npm run typecheck`, then `npm test`. The test runs the real store code against Node's built-in SQLite (Node 22.13 or later), including the migration from older versions. That SQLite has no FTS5, so search itself isn't covered.
 2. Deploy, then `GET /debug` with the PIN. It should come back with `phase: "idle"` and `paired: true`.
 3. `GET /debug/pull`. A quiet account should return `reason: "idle"` in about ten seconds.
-4. Call `list_chats`, then `get_messages` on a Hebrew or emoji-heavy chat, then `search_messages`.
+4. Call `list_chats`, then `get_messages` on a Hebrew or emoji-heavy chat, then `search_messages`. Then `unnamed_chats`, and `set_contact_names` on one number, and confirm the chat shows the name.
 5. If you touched ingest, relink and confirm the stored message count doesn't grow (re-import is idempotent) and that group messages show real sender names.
 
 ## Known gaps
 
-- Chats with no name anywhere (not in WhatsApp, not in your Google contacts) show as phone numbers. Numbers Google stores without a country code need `DEFAULT_COUNTRY_CODE`.
-- Contacts access dies after 7 days if the Google app is left in "Testing". `link_status` reports it when the daily sync fails; signing in again fixes it.
+- Chats with no name in WhatsApp and none saved show as phone numbers. Nothing refreshes names by itself: they only get saved when an agent (or you) does it.
 - If the daily pull finds the session logged out, nothing tells you. `link_status` shows it the next time your agent asks.
 - Edits and deletes are applied when they arrive as protocol messages. That path hasn't been tested against real ones.
 - It's only been exercised against one real account.

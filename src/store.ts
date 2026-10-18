@@ -3,6 +3,10 @@ import { getContentType, normalizeMessageContent, jidNormalizedUser } from '@whi
 import type { proto } from '@whiskeysockets/baileys';
 
 export function initSchema(sql: SqlStorage) {
+  // An earlier version synced names from Google. Keep those names, drop the credential.
+  const hasOld = sql.exec(`SELECT 1 FROM sqlite_master WHERE name = 'google_contacts'`).toArray().length > 0;
+  const hasNew = sql.exec(`SELECT 1 FROM sqlite_master WHERE name = 'custom_names'`).toArray().length > 0;
+  if (hasOld && !hasNew) sql.exec(`ALTER TABLE google_contacts RENAME TO custom_names`);
   sql.exec(`
     CREATE TABLE IF NOT EXISTS messages (
       id TEXT NOT NULL, chat TEXT NOT NULL, ts INTEGER NOT NULL, from_me INTEGER NOT NULL,
@@ -13,7 +17,7 @@ export function initSchema(sql: SqlStorage) {
     CREATE INDEX IF NOT EXISTS messages_ts ON messages (ts);
     CREATE TABLE IF NOT EXISTS chats (jid TEXT PRIMARY KEY, name TEXT, is_group INTEGER NOT NULL DEFAULT 0);
     CREATE TABLE IF NOT EXISTS contacts (jid TEXT PRIMARY KEY, name TEXT, notify TEXT);
-    CREATE TABLE IF NOT EXISTS google_contacts (jid TEXT PRIMARY KEY, name TEXT NOT NULL);
+    CREATE TABLE IF NOT EXISTS custom_names (jid TEXT PRIMARY KEY, name TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS alias (lid TEXT PRIMARY KEY, pn TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT);
     CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(body, content='messages', content_rowid='rowid');
@@ -28,6 +32,7 @@ export function initSchema(sql: SqlStorage) {
       INSERT INTO messages_fts(rowid, body) VALUES (new.rowid, new.body);
     END;
   `);
+  sql.exec(`DELETE FROM meta WHERE k LIKE 'google_%'`);
 }
 
 /** WhatsApp names chats it has no contact for after the number, sometimes masked ("+972∙∙∙∙∙∙∙20"). That is a placeholder, not a name. */
@@ -179,25 +184,45 @@ export class Store {
     });
   }
 
-  /** Replace the whole Google contacts snapshot. Keyed by WhatsApp jid, so matching is by phone number. */
-  replaceGoogleContacts(rows: { jid: string; name: string }[]) {
+  /**
+   * Save names for numbers. An empty name removes a saved one. Keyed by jid, so a name sticks to the
+   * phone number and shows up in every chat and group that person is in.
+   */
+  setCustomNames(rows: { jid: string; name: string }[]) {
+    let saved = 0, removed = 0, withChat = 0;
     this.tx(() => {
-      this.sql.exec(`DELETE FROM google_contacts`);
-      for (const r of rows) this.sql.exec(`INSERT OR IGNORE INTO google_contacts (jid, name) VALUES (?, ?)`, r.jid, r.name);
+      for (const r of rows) {
+        if (r.name) {
+          this.sql.exec(`INSERT INTO custom_names (jid, name) VALUES (?, ?) ON CONFLICT(jid) DO UPDATE SET name = excluded.name`, r.jid, r.name);
+          saved++;
+        } else {
+          removed += this.sql.exec(`DELETE FROM custom_names WHERE jid = ?`, r.jid).rowsWritten > 0 ? 1 : 0;
+        }
+        if (this.sql.exec(`SELECT 1 FROM messages WHERE chat = ? LIMIT 1`, r.jid).toArray().length) withChat++;
+      }
     });
+    return { saved, removed, withChat };
   }
-  googleContactCount(): number {
-    return this.sql.exec<{ n: number }>(`SELECT COUNT(*) n FROM google_contacts`).one().n;
-  }
-  /** Chats that now have a name only because of Google, for a sense of how much it helped. */
-  namedByGoogle(): number {
+
+  /** One-to-one chats that are still only a phone number: no WhatsApp name, no saved name, no display name. */
+  unnamedChats(limit: number) {
     return this.sql
-      .exec<{ n: number }>(
-        `SELECT COUNT(*) n FROM chats c JOIN google_contacts gc ON gc.jid = c.jid
-         LEFT JOIN contacts ct ON ct.jid = c.jid
-         WHERE c.is_group = 0 AND (c.name IS NULL OR ${numberLike('c.name')}) AND (ct.name IS NULL OR ${numberLike('ct.name')}) AND EXISTS (SELECT 1 FROM messages m WHERE m.chat = c.jid)`,
+      .exec(
+        `SELECT * FROM (
+           SELECT c.jid AS jid, ${this.nameExpr} AS name,
+                  (SELECT COUNT(*) FROM messages m WHERE m.chat = c.jid) AS messages,
+                  (SELECT MAX(ts) FROM messages m WHERE m.chat = c.jid) AS last_ts,
+                  (SELECT body FROM messages m WHERE m.chat = c.jid AND m.from_me = 0 ORDER BY ts DESC LIMIT 1) AS last_theirs
+           FROM chats c LEFT JOIN chats ch ON ch.jid = c.jid LEFT JOIN contacts ct ON ct.jid = c.jid LEFT JOIN custom_names cn ON cn.jid = c.jid
+           WHERE c.is_group = 0
+         ) WHERE messages > 0 AND (name = '+' || replace(jid, '@s.whatsapp.net', '') OR name = jid)
+         ORDER BY messages DESC, last_ts DESC LIMIT ?`,
+        limit,
       )
-      .one().n;
+      .toArray();
+  }
+  unnamedCount(): number {
+    return this.unnamedChats(100000).length;
   }
 
   setMeta(k: string, v: string) {
@@ -217,7 +242,7 @@ export class Store {
 
   // ---------- queries ----------
 
-  private nameExpr = `COALESCE(${realName('ch.name')}, ${realName('ct.name')}, gc.name, ${realName('ct.notify')},
+  private nameExpr = `COALESCE(${realName('ch.name')}, ${realName('ct.name')}, cn.name, ${realName('ct.notify')},
       (SELECT push_name FROM messages p WHERE p.chat = c.jid AND p.from_me = 0 AND p.push_name IS NOT NULL ORDER BY p.ts DESC LIMIT 1),
       CASE WHEN c.jid LIKE '%@s.whatsapp.net' THEN '+' || replace(c.jid, '@s.whatsapp.net', '') ELSE c.jid END)`;
 
@@ -228,7 +253,7 @@ export class Store {
     return this.sql
       .exec<{ jid: string; name: string }>(
         `SELECT c.jid, ${this.nameExpr} AS name FROM chats c
-         LEFT JOIN chats ch ON ch.jid = c.jid LEFT JOIN contacts ct ON ct.jid = c.jid LEFT JOIN google_contacts gc ON gc.jid = c.jid
+         LEFT JOIN chats ch ON ch.jid = c.jid LEFT JOIN contacts ct ON ct.jid = c.jid LEFT JOIN custom_names cn ON cn.jid = c.jid
          WHERE EXISTS (SELECT 1 FROM messages m WHERE m.chat = c.jid)
            AND (${this.nameExpr} LIKE ? OR c.jid LIKE ?)
          ORDER BY (SELECT MAX(ts) FROM messages m WHERE m.chat = c.jid) DESC LIMIT 10`,
@@ -242,7 +267,7 @@ export class Store {
       this.sql
         .exec<{ name: string }>(
           `SELECT ${this.nameExpr} AS name FROM (SELECT ? AS jid) c
-           LEFT JOIN chats ch ON ch.jid = c.jid LEFT JOIN contacts ct ON ct.jid = c.jid LEFT JOIN google_contacts gc ON gc.jid = c.jid`,
+           LEFT JOIN chats ch ON ch.jid = c.jid LEFT JOIN contacts ct ON ct.jid = c.jid LEFT JOIN custom_names cn ON cn.jid = c.jid`,
           jid,
         )
         .toArray()[0]?.name ?? jid
@@ -257,7 +282,7 @@ export class Store {
            SELECT c.jid AS jid, ${this.nameExpr} AS name, c.is_group AS is_group,
                   (SELECT COUNT(*) FROM messages m WHERE m.chat = c.jid) AS messages,
                   (SELECT MAX(ts) FROM messages m WHERE m.chat = c.jid) AS last_ts
-           FROM chats c LEFT JOIN chats ch ON ch.jid = c.jid LEFT JOIN contacts ct ON ct.jid = c.jid LEFT JOIN google_contacts gc ON gc.jid = c.jid
+           FROM chats c LEFT JOIN chats ch ON ch.jid = c.jid LEFT JOIN contacts ct ON ct.jid = c.jid LEFT JOIN custom_names cn ON cn.jid = c.jid
          ) WHERE messages > 0 AND (name LIKE ? OR jid LIKE ?)
          ORDER BY last_ts DESC LIMIT ?`,
         like, like, limit,
@@ -265,7 +290,7 @@ export class Store {
       .toArray();
   }
 
-  private senderName = `CASE WHEN m.from_me = 1 THEN 'Me' ELSE COALESCE(${realName('ct.name')}, gc.name, ${realName('ct.notify')}, m.push_name, '+' || replace(replace(m.sender, '@s.whatsapp.net', ''), '@lid', ''), 'unknown') END`;
+  private senderName = `CASE WHEN m.from_me = 1 THEN 'Me' ELSE COALESCE(${realName('ct.name')}, cn.name, ${realName('ct.notify')}, m.push_name, '+' || replace(replace(m.sender, '@s.whatsapp.net', ''), '@lid', ''), 'unknown') END`;
 
   getMessages(opts: { chat: string; before?: number; after?: number; limit: number; newestFirst?: boolean }) {
     const where = [`m.chat = ?`];
@@ -277,7 +302,7 @@ export class Store {
     const rows = this.sql
       .exec(
         `SELECT m.id, m.ts, ${this.senderName} AS sender, m.type, m.body
-         FROM messages m LEFT JOIN contacts ct ON ct.jid = m.sender LEFT JOIN google_contacts gc ON gc.jid = m.sender
+         FROM messages m LEFT JOIN contacts ct ON ct.jid = m.sender LEFT JOIN custom_names cn ON cn.jid = m.sender
          WHERE ${where.join(' AND ')} ORDER BY m.ts ${order} LIMIT ?`,
         ...args, opts.limit,
       )
@@ -294,10 +319,10 @@ export class Store {
     return this.sql
       .exec(
         `SELECT m.id, m.chat, m.ts, ${this.senderName} AS sender, m.body,
-                (SELECT COALESCE(${realName('ch.name')}, ${realName('ct2.name')}, gc2.name, ${realName('ct2.notify')}, m.chat) FROM (SELECT m.chat AS jid) x
-                  LEFT JOIN chats ch ON ch.jid = x.jid LEFT JOIN contacts ct2 ON ct2.jid = x.jid LEFT JOIN google_contacts gc2 ON gc2.jid = x.jid) AS chat_name
+                (SELECT COALESCE(${realName('ch.name')}, ${realName('ct2.name')}, cn2.name, ${realName('ct2.notify')}, m.chat) FROM (SELECT m.chat AS jid) x
+                  LEFT JOIN chats ch ON ch.jid = x.jid LEFT JOIN contacts ct2 ON ct2.jid = x.jid LEFT JOIN custom_names cn2 ON cn2.jid = x.jid) AS chat_name
          FROM messages_fts JOIN messages m ON m.rowid = messages_fts.rowid
-         LEFT JOIN contacts ct ON ct.jid = m.sender LEFT JOIN google_contacts gc ON gc.jid = m.sender
+         LEFT JOIN contacts ct ON ct.jid = m.sender LEFT JOIN custom_names cn ON cn.jid = m.sender
          WHERE ${where.join(' AND ')} ORDER BY m.ts DESC LIMIT ?`,
         ...args, opts.limit,
       )

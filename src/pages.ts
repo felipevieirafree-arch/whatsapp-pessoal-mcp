@@ -5,11 +5,10 @@ export function messagePage(title: string, text: string, status?: { href: string
   return page(title, `<h1>${esc(title)}</h1><p>${esc(text)}</p>${status ? `<a class="button" href="${esc(status.href)}">${esc(status.label)}</a>` : ''}`);
 }
 
-export function consentPage(clientName: string, signInUrl: string, label: string, note = '') {
+export function consentPage(clientName: string, signInUrl: string, label: string) {
   return page('Allow access', `
 <h1>Give ${esc(clientName)} read access?</h1>
-<p>It will be able to search and read your WhatsApp messages. It can't send or change anything.</p>
-${note ? `<p>${esc(note)}</p>` : ''}
+<p>It will be able to search and read your WhatsApp messages, and to save names for phone numbers. It can't send anything.</p>
 <a class="button" href="${esc(signInUrl)}">${esc(label)}</a>
 <p class="muted" style="margin-top:20px"><a href="/privacy">Privacy policy</a> and <a href="/tos">terms of service</a></p>`);
 }
@@ -131,7 +130,7 @@ function doneScreen(s) {
   var cmd = 'claude mcp add --transport http whatsapp ' + location.origin + '/mcp';
   if (!screen('done',
     '<h1>' + tickIcon + 'WhatsApp is linked</h1>' +
-    '<p class="stat" id="summary"></p><p class="muted" id="google"></p>' +
+    '<p class="stat" id="summary"></p><p class="muted" id="unnamed"></p>' +
     '<div class="section"><h2>Connect your agent</h2>' +
     '<p>In Claude Code, run this, then type <code>/mcp</code> and sign in:</p>' +
     '<div class="cmd"><code id="cmd"></code><button id="copy" type="button">Copy</button></div>' +
@@ -154,10 +153,7 @@ function doneScreen(s) {
 
 function summarize(s) {
   el('summary').textContent = fmt(s.messages) + ' messages from ' + fmt(s.chats) + ' chats are stored and ready.';
-  var g = s.google, t = '';
-  if (g && g.error) t = 'Google contacts: ' + g.error;
-  else if (g && g.connected) t = 'Google contacts: ' + fmt(g.names) + ' names matched' + (g.namedByGoogle ? ', naming ' + fmt(g.namedByGoogle) + ' chats WhatsApp had no name for.' : '.');
-  el('google').textContent = t;
+  el('unnamed').textContent = s.unnamed ? fmt(s.unnamed) + ' chats are known only by phone number. Ask your agent to find their names in your contacts.' : '';
 }
 
 function finish() {

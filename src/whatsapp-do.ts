@@ -13,7 +13,6 @@ import type { WASocket } from '@whiskeysockets/baileys';
 import qrcode from 'qrcode-generator';
 import { sqliteAuthState } from './auth-state.js';
 import { Store, initSchema } from './store.js';
-import { fetchContacts, refreshAccessToken, GoogleError } from './google.js';
 import type { Env } from './index.js';
 
 type Phase = 'idle' | 'connecting' | 'qr' | 'syncing';
@@ -82,7 +81,7 @@ export class WhatsAppStore extends DurableObject<Env> {
       phase: this.phase,
       running: Boolean(this.session),
       progress: this.historyProgress,
-      google: this.contactsInfo(),
+      unnamed: this.store.unnamedCount(),
       qrSvg,
       pairingCode: this.pairingCode,
       ...this.store.counts(),
@@ -143,47 +142,7 @@ export class WhatsAppStore extends DurableObject<Env> {
   }
 
   linkInfo() {
-    return { paired: this.auth.isPaired(), lastPull: this.lastPull(), ...this.store.counts() };
-  }
-
-  // ---------- Google contacts ----------
-
-  /** Keep the refresh token next to the WhatsApp session. It's the same kind of secret. */
-  saveGoogleToken(refreshToken: string) {
-    this.store.setMeta('google_refresh', refreshToken);
-    this.store.setMeta('google_error', '');
-  }
-
-  /** Re-read the owner's Google contacts and match them to chats by phone number. */
-  async syncContacts(accessToken?: string): Promise<{ contacts: number; namedByGoogle: number }> {
-    try {
-      if (!accessToken) {
-        const refresh = this.store.getMeta('google_refresh');
-        if (!refresh) throw new GoogleError('Google is not connected', 'not_connected');
-        accessToken = await refreshAccessToken(this.env, refresh);
-      }
-      const { rows, saved, other } = await fetchContacts(accessToken, this.env.DEFAULT_COUNTRY_CODE);
-      this.store.replaceGoogleContacts(rows);
-      this.store.setMeta('google_synced', String(Date.now()));
-      this.store.setMeta('google_error', '');
-      this.note(`google contacts: ${rows.length} numbers from ${saved} saved + ${other} other contacts`);
-      return { contacts: rows.length, namedByGoogle: this.store.namedByGoogle() };
-    } catch (e: any) {
-      // invalid_grant means the refresh token died (Google expires them after 7 days for apps in Testing)
-      const msg = e instanceof GoogleError && e.code === 'invalid_grant' ? 'Google access expired. Sign in again at /setup.' : String(e?.message ?? e);
-      this.store.setMeta('google_error', msg);
-      throw e;
-    }
-  }
-
-  contactsInfo() {
-    return {
-      connected: Boolean(this.store.getMeta('google_refresh')),
-      names: this.store.googleContactCount(),
-      namedByGoogle: this.store.namedByGoogle(),
-      lastSync: Number(this.store.getMeta('google_synced') ?? 0),
-      error: this.store.getMeta('google_error') || null,
-    };
+    return { paired: this.auth.isPaired(), lastPull: this.lastPull(), unnamed: this.store.unnamedCount(), ...this.store.counts() };
   }
 
   lastPull(): number {
@@ -217,6 +176,8 @@ export class WhatsAppStore extends DurableObject<Env> {
   getMessages(o: Parameters<Store['getMessages']>[0]) { return this.store.getMessages(o); }
   search(o: Parameters<Store['search']>[0]) { return this.store.search(o); }
   counts() { return this.store.counts(); }
+  unnamedChats(limit: number) { return this.store.unnamedChats(limit); }
+  setNames(rows: { jid: string; name: string }[]) { return this.store.setCustomNames(rows); }
   /** Debug only: one read-only SELECT. Guarded by the PIN at the route. */
   select(query: string) {
     if (!/^\s*select\b/i.test(query) || query.includes(';')) throw new Error('only a single SELECT is allowed');
