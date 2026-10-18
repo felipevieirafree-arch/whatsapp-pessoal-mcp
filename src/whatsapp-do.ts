@@ -6,7 +6,7 @@
  * connected, writes it to SQLite, and hangs up. Pairing is the same session
  * with the QR exposed and a longer leash, so the first full history sync lands.
  */
-import './polyfills.js';
+import { liveIntervals } from './polyfills.js';
 import { DurableObject } from 'cloudflare:workers';
 import { makeWASocket, DisconnectReason } from '@whiskeysockets/baileys';
 import type { WASocket } from '@whiskeysockets/baileys';
@@ -82,6 +82,7 @@ export class WhatsAppStore extends DurableObject<Env> {
       phase: this.phase,
       running: Boolean(this.session),
       progress: this.historyProgress,
+      google: this.contactsInfo(),
       qrSvg,
       pairingCode: this.pairingCode,
       ...this.store.counts(),
@@ -216,6 +217,11 @@ export class WhatsAppStore extends DurableObject<Env> {
   getMessages(o: Parameters<Store['getMessages']>[0]) { return this.store.getMessages(o); }
   search(o: Parameters<Store['search']>[0]) { return this.store.search(o); }
   counts() { return this.store.counts(); }
+  /** Debug only: one read-only SELECT. Guarded by the PIN at the route. */
+  select(query: string) {
+    if (!/^\s*select\b/i.test(query) || query.includes(';')) throw new Error('only a single SELECT is allowed');
+    return this.ctx.storage.sql.exec(query).toArray().slice(0, 50);
+  }
   typeCounts() { return this.ctx.storage.sql.exec(`SELECT type, COUNT(*) n FROM messages GROUP BY type ORDER BY n DESC`).toArray(); }
 
   // ---------- the session ----------
@@ -224,6 +230,7 @@ export class WhatsAppStore extends DurableObject<Env> {
 
   private runSession(opts: { pairing: boolean; maxMs: number; idleMs: number }): Promise<SessionResult> {
     const started = Date.now();
+    const intervalsBefore = new Set(liveIntervals);
     this.sessionAdded = 0;
     this.historyProgress = null;
     this.phase = 'connecting';
@@ -243,6 +250,8 @@ export class WhatsAppStore extends DurableObject<Env> {
         clearInterval(timer);
         try { this.sock?.end(undefined); } catch {}
         this.sock = null;
+        // stop the timers Baileys leaked, so the object can go idle and pick up new code
+        for (const id of [...liveIntervals]) if (!intervalsBefore.has(id)) clearInterval(id);
         this.phase = 'idle';
         this.qr = null;
         this.pairingCode = null;

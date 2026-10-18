@@ -60,7 +60,7 @@ footer { margin-top: 56px; padding-top: 20px; border-top: 1px solid var(--rule);
 
   <footer class="muted">
     <p>It doesn't stay connected. When your agent asks, and once a day, it connects, collects what's new, and hangs up. Your phone keeps working normally.</p>
-    <p>WhatsApp has no official API for this. It uses the same protocol as WhatsApp Web, so use it on your own account, read-only. <a href="${REPO}">Source and setup guide</a>.</p>
+    <p>WhatsApp has no official API for this. It uses the same protocol as WhatsApp Web, so use it on your own account, read-only. <a href="${REPO}">Source and setup guide</a>. <a href="/privacy">Privacy policy</a>.</p>
   </footer>
 </main>
 <script>${copyScript}</script>

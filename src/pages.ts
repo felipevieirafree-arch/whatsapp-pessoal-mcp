@@ -10,7 +10,8 @@ export function consentPage(clientName: string, signInUrl: string, label: string
 <h1>Give ${esc(clientName)} read access?</h1>
 <p>It will be able to search and read your WhatsApp messages. It can't send or change anything.</p>
 ${note ? `<p>${esc(note)}</p>` : ''}
-<a class="button" href="${esc(signInUrl)}">${esc(label)}</a>`);
+<a class="button" href="${esc(signInUrl)}">${esc(label)}</a>
+<p class="muted" style="margin-top:20px"><a href="/privacy">Privacy policy</a></p>`);
 }
 
 export function loginPage(action: string, error?: string) {
@@ -130,14 +131,14 @@ function doneScreen(s) {
   var cmd = 'claude mcp add --transport http whatsapp ' + location.origin + '/mcp';
   if (!screen('done',
     '<h1>' + tickIcon + 'WhatsApp is linked</h1>' +
-    '<p class="stat" id="summary"></p>' +
+    '<p class="stat" id="summary"></p><p class="muted" id="google"></p>' +
     '<div class="section"><h2>Connect your agent</h2>' +
     '<p>In Claude Code, run this, then type <code>/mcp</code> and sign in:</p>' +
     '<div class="cmd"><code id="cmd"></code><button id="copy" type="button">Copy</button></div>' +
     '<p class="muted">Other MCP clients: point them at <code id="url"></code>.</p></div>' +
     '<div class="quiet"><div class="row" id="relinkRow"><button class="text" id="relink" type="button">Unlink and scan again</button>' +
-    '<a href="/">Back to the front page</a></div></div>')) { el('summary').textContent = fmt(s.messages) + ' messages from ' + fmt(s.chats) + ' chats are stored and ready.'; return; }
-  el('summary').textContent = fmt(s.messages) + ' messages from ' + fmt(s.chats) + ' chats are stored and ready.';
+    '<a href="/signout">Sign out</a></div></div>')) { summarize(s); return; }
+  summarize(s);
   el('cmd').textContent = cmd; el('url').textContent = location.origin + '/mcp';
   el('copy').onclick = function () {
     var b = el('copy');
@@ -149,6 +150,14 @@ function doneScreen(s) {
     el('no').onclick = function () { view = ''; };
     el('yes').onclick = function () { this.disabled = true; this.textContent = 'Unlinking...'; post('/pair/relink').then(function () { location.reload(); }); };
   };
+}
+
+function summarize(s) {
+  el('summary').textContent = fmt(s.messages) + ' messages from ' + fmt(s.chats) + ' chats are stored and ready.';
+  var g = s.google, t = '';
+  if (g && g.error) t = 'Google contacts: ' + g.error;
+  else if (g && g.connected) t = 'Google contacts: ' + fmt(g.names) + ' names matched' + (g.namedByGoogle ? ', naming ' + fmt(g.namedByGoogle) + ' chats WhatsApp had no name for.' : '.');
+  el('google').textContent = t;
 }
 
 function finish() {

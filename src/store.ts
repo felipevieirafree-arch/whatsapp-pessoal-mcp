@@ -30,6 +30,12 @@ export function initSchema(sql: SqlStorage) {
   `);
 }
 
+/** WhatsApp names chats it has no contact for after the number, sometimes masked ("+972∙∙∙∙∙∙∙20"). That is a placeholder, not a name. */
+const numberLike = (x: string) => `(${x} LIKE '%∙%' OR trim(replace(replace(replace(${x}, '+', ''), ' ', ''), '-', ''), '0123456789') = '')`;
+const realName = (x: string) => `(CASE WHEN ${x} IS NULL OR ${numberLike(x)} THEN NULL ELSE ${x} END)`;
+
+/** The same test in JS, so placeholders never get stored. */
+const isPlaceholder = (name?: string | null) => !name || /∙/.test(name) || /^[\d\s+-]*$/.test(name);
 const num = (v: unknown) => Number((v as { toNumber?: () => number })?.toNumber?.() ?? v ?? 0);
 
 /** What a message says, in text. Media becomes a short label so search and reading still make sense. */
@@ -153,7 +159,7 @@ export class Store {
         this.sql.exec(
           `INSERT INTO contacts (jid, name, notify) VALUES (?,?,?)
            ON CONFLICT(jid) DO UPDATE SET name = COALESCE(excluded.name, name), notify = COALESCE(excluded.notify, notify)`,
-          jid, c.name ?? null, c.notify ?? c.verifiedName ?? null,
+          jid, isPlaceholder(c.name) ? null : c.name, isPlaceholder(c.notify ?? c.verifiedName) ? null : (c.notify ?? c.verifiedName),
         );
       }
     });
@@ -163,7 +169,7 @@ export class Store {
     this.tx(() => {
       for (const c of chats) {
         const name = c.name ?? c.subject;
-        if (!c.id || !name) continue;
+        if (!c.id || !name || isPlaceholder(name)) continue;
         const jid = this.norm(c.id) ?? c.id;
         this.sql.exec(
           `INSERT INTO chats (jid, name, is_group) VALUES (?,?,?) ON CONFLICT(jid) DO UPDATE SET name = excluded.name`,
@@ -189,7 +195,7 @@ export class Store {
       .exec<{ n: number }>(
         `SELECT COUNT(*) n FROM chats c JOIN google_contacts gc ON gc.jid = c.jid
          LEFT JOIN contacts ct ON ct.jid = c.jid
-         WHERE c.is_group = 0 AND c.name IS NULL AND ct.name IS NULL AND EXISTS (SELECT 1 FROM messages m WHERE m.chat = c.jid)`,
+         WHERE c.is_group = 0 AND (c.name IS NULL OR ${numberLike('c.name')}) AND (ct.name IS NULL OR ${numberLike('ct.name')}) AND EXISTS (SELECT 1 FROM messages m WHERE m.chat = c.jid)`,
       )
       .one().n;
   }
@@ -211,9 +217,9 @@ export class Store {
 
   // ---------- queries ----------
 
-  private nameExpr = `COALESCE(ch.name, ct.name, gc.name, ct.notify,
+  private nameExpr = `COALESCE(${realName('ch.name')}, ${realName('ct.name')}, gc.name, ${realName('ct.notify')},
       (SELECT push_name FROM messages p WHERE p.chat = c.jid AND p.from_me = 0 AND p.push_name IS NOT NULL ORDER BY p.ts DESC LIMIT 1),
-      c.jid)`;
+      CASE WHEN c.jid LIKE '%@s.whatsapp.net' THEN '+' || replace(c.jid, '@s.whatsapp.net', '') ELSE c.jid END)`;
 
   /** Resolve a chat reference (jid, or name/number fragment) to jids. */
   resolveChat(ref: string): { jid: string; name: string }[] {
@@ -259,7 +265,7 @@ export class Store {
       .toArray();
   }
 
-  private senderName = `CASE WHEN m.from_me = 1 THEN 'Me' ELSE COALESCE(ct.name, gc.name, ct.notify, m.push_name, '+' || replace(replace(m.sender, '@s.whatsapp.net', ''), '@lid', ''), 'unknown') END`;
+  private senderName = `CASE WHEN m.from_me = 1 THEN 'Me' ELSE COALESCE(${realName('ct.name')}, gc.name, ${realName('ct.notify')}, m.push_name, '+' || replace(replace(m.sender, '@s.whatsapp.net', ''), '@lid', ''), 'unknown') END`;
 
   getMessages(opts: { chat: string; before?: number; after?: number; limit: number; newestFirst?: boolean }) {
     const where = [`m.chat = ?`];
@@ -288,7 +294,7 @@ export class Store {
     return this.sql
       .exec(
         `SELECT m.id, m.chat, m.ts, ${this.senderName} AS sender, m.body,
-                (SELECT COALESCE(ch.name, ct2.name, gc2.name, ct2.notify, m.chat) FROM (SELECT m.chat AS jid) x
+                (SELECT COALESCE(${realName('ch.name')}, ${realName('ct2.name')}, gc2.name, ${realName('ct2.notify')}, m.chat) FROM (SELECT m.chat AS jid) x
                   LEFT JOIN chats ch ON ch.jid = x.jid LEFT JOIN contacts ct2 ON ct2.jid = x.jid LEFT JOIN google_contacts gc2 ON gc2.jid = x.jid) AS chat_name
          FROM messages_fts JOIN messages m ON m.rowid = messages_fts.rowid
          LEFT JOIN contacts ct ON ct.jid = m.sender LEFT JOIN google_contacts gc ON gc.jid = m.sender

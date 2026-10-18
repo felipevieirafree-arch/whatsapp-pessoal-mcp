@@ -45,6 +45,25 @@ export const usesLoginService = (env: AuthEnv) => authMode(env) === 'login-servi
 /** Key for the short-lived pairing token in the two modes where we mint it ourselves. */
 const tokenKey = (env: AuthEnv) => (authMode(env) === 'google' ? env.GOOGLE_CLIENT_SECRET : env.OWNER_PASSWORD);
 
+export const SESSION_COOKIE = 'wa_session';
+const SESSION_DAYS = 14;
+
+/** A long-lived, HttpOnly cookie value that says "this browser signed in as the owner". Null in login-service mode, which has no key to sign with. */
+export async function mintSession(env: AuthEnv): Promise<string | null> {
+  const key = tokenKey(env);
+  if (authMode(env) === 'login-service' || !key || key.length < 12) return null;
+  const exp = String(Date.now() + SESSION_DAYS * 86_400_000);
+  return `${exp}.${await hmac(key, `session:${exp}`)}`;
+}
+export async function isOwnerSession(env: AuthEnv, value: string | undefined): Promise<boolean> {
+  const key = tokenKey(env);
+  const [exp, sig] = (value ?? '').split('.');
+  if (!exp || !sig || Number(exp) < Date.now() || !key || authMode(env) === 'login-service') return false;
+  return sameSecret(sig, await hmac(key, `session:${exp}`));
+}
+export const sessionCookie = (value: string, maxAge = SESSION_DAYS * 86_400) =>
+  `${SESSION_COOKIE}=${value}; Path=/; Max-Age=${maxAge}; HttpOnly; Secure; SameSite=Lax`;
+
 /** A 30 minute bearer token for the pairing page. */
 export async function mintToken(env: AuthEnv): Promise<string | null> {
   const key = tokenKey(env);
