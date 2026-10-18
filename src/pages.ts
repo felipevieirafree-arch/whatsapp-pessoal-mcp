@@ -11,7 +11,7 @@ export function consentPage(clientName: string, signInUrl: string, label: string
 <p>It will be able to search and read your WhatsApp messages. It can't send or change anything.</p>
 ${note ? `<p>${esc(note)}</p>` : ''}
 <a class="button" href="${esc(signInUrl)}">${esc(label)}</a>
-<p class="muted" style="margin-top:20px"><a href="/privacy">Privacy policy</a></p>`);
+<p class="muted" style="margin-top:20px"><a href="/privacy">Privacy policy</a> and <a href="/tos">terms of service</a></p>`);
 }
 
 export function loginPage(action: string, error?: string) {

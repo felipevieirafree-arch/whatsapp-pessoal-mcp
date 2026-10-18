@@ -14,6 +14,7 @@ import { handleMcp } from './mcp.js';
 import { consentPage, loginPage, messagePage, pairPage } from './pages.js';
 import { landingPage } from './landing.js';
 import { privacyPage } from './privacy.js';
+import { tosPage } from './tos.js';
 import {
   authMode, consentNote, isOwnerSession, isOwnerToken, mintSession, mintToken, sessionCookie, SESSION_COOKIE, peekPending, signInLabel, startSignIn, takePending,
   tokenFromLoginCode, tokenFromPassword, usesLoginService,
@@ -89,6 +90,7 @@ const ownerHandler = {
       return html(landingPage(url.origin));
     }
     if (path === '/privacy') return html(privacyPage(env.OPERATOR_NAME));
+    if (path === '/tos') return html(tosPage(env.OPERATOR_NAME));
     if (path === '/signout') return new Response(null, { status: 302, headers: { location: '/', 'set-cookie': sessionCookie('', 0) } });
 
     // An MCP client wants in: show who is asking, then send the owner to sign in.

@@ -41,5 +41,6 @@ export function privacyPage(operator?: string) {
 <h2>Questions and changes</h2>
 <p>Questions go in an <a href="${REPO}/issues">issue on GitHub</a>. If this policy changes, the new version replaces this page and the date above changes with it.</p>
 
-<p style="margin-top:32px"><a href="/">Back</a></p>`);
+<p style="margin-top:32px"><a href="/tos">Terms of service</a></p>
+<p><a href="/">Back</a></p>`);
 }

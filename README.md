@@ -57,7 +57,7 @@ A password is the simplest way in. Google sign-in is better if you want your con
 1. Create a project and enable the **People API**.
 2. Under Google Auth Platform, create an **OAuth client** of type "Web application". Add `https://your-domain/callback/google` as an authorized redirect URI. It has to be a domain you control, not a `localhost` address.
 3. Add the scopes `contacts.readonly` and `contacts.other.readonly`. Add yourself as a test user.
-4. Fill in the consent screen's links: app home page `https://your-domain/` and privacy policy `https://your-domain/privacy`. The server serves a privacy policy that matches what it does; if you change what it stores, edit `src/privacy.ts` too. Then **publish the app** ("In production"). Google shows a warning that it isn't verified, which is fine for a single user. If you leave it in "Testing", Google expires the contacts access after 7 days and names stop updating.
+4. Fill in the consent screen's links: app home page `https://your-domain/`, privacy policy `https://your-domain/privacy` and terms of service `https://your-domain/tos`. The server serves both, written to match what it does; if you change what it stores or who can use it, edit `src/privacy.ts` and `src/tos.ts` too. Neither is legal advice. Then **publish the app** ("In production"). Google shows a warning that it isn't verified, which is fine for a single user. If you leave it in "Testing", Google expires the contacts access after 7 days and names stop updating.
 5. Give the Worker the client and your email:
 
    ```sh
@@ -136,7 +136,7 @@ One Durable Object holds everything. Its SQLite is both the Baileys auth store a
 | `src/store.ts` | Schema, ingesting Baileys events into SQLite, and every query. |
 | `src/auth-state.ts` | Baileys auth state backed by the DO's SQLite (replaces `useMultiFileAuthState`). |
 | `src/mcp.ts` | The MCP tools. |
-| `src/pages.ts`, `src/landing.ts`, `src/privacy.ts`, `src/ui.ts` | All HTML. `ui.ts` has the shared design tokens. |
+| `src/pages.ts`, `src/landing.ts`, `src/privacy.ts`, `src/tos.ts`, `src/ui.ts` | All HTML. `ui.ts` has the shared design tokens. |
 | `src/ws-shim.ts`, `src/lru-shim.ts`, `src/polyfills.ts` | Make Baileys run on workerd. See below. |
 | `scripts/vendor-bridge.mjs` | Extracts the wasm from Baileys' Rust bridge. Runs on `npm install`. |
 | `local-export/` | A separate one-off script that dumps your history to JSON files with no server. Not part of the deployment. |
