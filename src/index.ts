@@ -14,10 +14,11 @@ import { handleMcp } from './mcp.js';
 import { consentPage, loginPage, messagePage, pairPage } from './pages.js';
 import { landingPage } from './landing.js';
 import {
-  isOwnerToken, peekPending, signInLabel, startSignIn, takePending,
+  authMode, consentNote, isOwnerToken, mintToken, peekPending, signInLabel, startSignIn, takePending,
   tokenFromLoginCode, tokenFromPassword, usesLoginService,
   type AuthEnv,
 } from './auth.js';
+import { completeSignIn } from './google.js';
 
 export { WhatsAppStore };
 
@@ -26,6 +27,8 @@ export interface Env extends AuthEnv {
   OAUTH_PROVIDER: OAuthHelpers;
   /** Optional secret for machine access to /debug. 32+ random characters. */
   PIN?: string;
+  /** Country code (digits, no +) for contact numbers Google can't place, e.g. "972". */
+  DEFAULT_COUNTRY_CODE?: string;
 }
 
 const html = (body: string, status = 200) => new Response(body, { status, headers: { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store' } });
@@ -71,7 +74,7 @@ const ownerHandler = {
     if (path === '/authorize') {
       const oauth = await env.OAUTH_PROVIDER.parseAuthRequest(request);
       const client = await env.OAUTH_PROVIDER.lookupClient(oauth.clientId);
-      return html(consentPage(client?.clientName ?? 'An app', await startSignIn(env, url.origin, { oauth }), signInLabel(env)));
+      return html(consentPage(client?.clientName ?? 'An app', await startSignIn(env, url.origin, { oauth }), signInLabel(env), consentNote(env)));
     }
     if (path === '/setup') return Response.redirect(await startSignIn(env, url.origin, {}), 302);
 
@@ -82,6 +85,23 @@ const ownerHandler = {
       const token = await tokenFromPassword(env, String((await request.formData()).get('password') ?? ''));
       if (!token) return html(loginPage(url.pathname + url.search, 'Wrong password.'), 401);
       return proceed(env, p, token);
+    }
+
+    // Google mode: back from Google. Only the owner gets in, and their grant is kept for the contacts sync.
+    if (path === '/callback/google' && authMode(env) === 'google') {
+      const code = url.searchParams.get('code');
+      if (!code) return plain('Sign-in cancelled', 'Nothing was linked.', 401);
+      let g;
+      try { g = await completeSignIn(env, url.origin, code); }
+      catch (e: any) { return plain('Google sign-in failed', String(e?.message ?? e), 502); }
+      if (!g.emailVerified || g.email.toLowerCase() !== (env.OWNER_EMAIL ?? '').toLowerCase()) return plain('Not your server', 'This server belongs to someone else.', 403);
+      const store = wa(env);
+      if (g.refreshToken) await store.saveGoogleToken(g.refreshToken);
+      // naming chats is a bonus; never let it block signing in
+      await store.syncContacts(g.accessToken).catch((e) => console.log('contacts sync failed', String(e)));
+      const token = await mintToken(env);
+      if (!token) return plain('Server misconfigured', 'The signing secret is too short.', 500);
+      return proceed(env, url.searchParams.get('state') ?? '', token);
     }
 
     // Login service mode: back from the service with a one-time code.
@@ -135,6 +155,7 @@ async function debugRoute(path: string, url: URL, env: Env): Promise<Response> {
     const [c] = await wa(env).resolveChat(q.get('chat') ?? '');
     return json(c ? { chat: c, rows: await wa(env).getMessages({ chat: c.jid, limit: 8 }) } : { error: 'no chat' });
   }
+  if (path === '/debug/contacts') return json(q.get('sync') ? await wa(env).syncContacts().catch((e) => ({ error: String(e?.message ?? e) })) : await wa(env).contactsInfo());
   if (path === '/debug/logout') { await wa(env).logout(); return json({ ok: true }); }
   return json(await wa(env).debug());
 }
@@ -159,6 +180,7 @@ export default {
       (async () => {
         const stub = wa(env);
         if (await stub.isPaired()) console.log('daily pull', await stub.pull());
+        if ((await stub.contactsInfo()).connected) console.log('daily contacts', await stub.syncContacts().catch((e) => String(e)));
       })(),
     );
   },

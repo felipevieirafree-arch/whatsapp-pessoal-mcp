@@ -48,7 +48,26 @@ Wrangler prints your URL, something like `https://whatsapp-mcp.your-name.workers
 
    Then type `/mcp` and sign in with the password. Other clients: point them at the same `/mcp` URL.
 
-If you want your own domain, or Google sign-in instead of a password, see the comments at the bottom of `wrangler.jsonc`.
+If you want your own domain, see the comments at the bottom of `wrangler.jsonc`.
+
+### Sign in with Google, and get names for your chats
+
+A password is the simplest way in. Google sign-in is better if you want your contacts' names on chats, because the same login also lets the server read your Google contacts (read-only). You need a Google Cloud project of your own:
+
+1. Create a project and enable the **People API**.
+2. Under Google Auth Platform, create an **OAuth client** of type "Web application". Add `https://your-domain/callback/google` as an authorized redirect URI. It has to be a domain you control, not a `localhost` address.
+3. Add the scopes `contacts.readonly` and `contacts.other.readonly`. Add yourself as a test user.
+4. **Publish the app** ("In production"). Google shows a warning that it isn't verified, which is fine for a single user. If you leave it in "Testing", Google expires the contacts access after 7 days and names stop updating.
+5. Give the Worker the client and your email:
+
+   ```sh
+   npx wrangler secret put GOOGLE_CLIENT_ID
+   npx wrangler secret put GOOGLE_CLIENT_SECRET
+   ```
+
+   and in `wrangler.jsonc` add `"vars": { "OWNER_EMAIL": "you@gmail.com", "DEFAULT_COUNTRY_CODE": "1" }`. The country code (digits, no plus) is only used for numbers in your contacts that Google can't place on its own.
+
+Then open `/setup` and sign in. Contacts refresh on every sign-in, on the daily pull, and when your agent calls `sync_now`.
 
 ### The Workers Paid note
 
@@ -60,7 +79,7 @@ Importing a large history decodes a lot of data in one go, and the default CPU l
 
 **You get what WhatsApp sends.** The first link imports whatever history WhatsApp decides to hand a new device. It may not be everything. It only does this once per link. To import again, relink (your stored messages are kept, and a re-import fills in anything missing).
 
-**Some chats show up as phone numbers.** WhatsApp doesn't give a linked device every contact name. Chats with people it has no name for show as a number. Importing your address book to fill these in is the obvious next feature and isn't built yet.
+**Some chats show up as phone numbers.** WhatsApp doesn't give a linked device every contact name. Chats with people it has no name for show as a number. If you sign in with Google (see below), the server reads your Google contacts and matches them to chats by phone number, which fills most of these in.
 
 **Media isn't downloaded.** Photos, voice notes and documents appear as labels like `[image]` or `[voice note 12s]`, with the caption if there was one. Nothing is transcribed.
 
@@ -111,7 +130,8 @@ One Durable Object holds everything. Its SQLite is both the Baileys auth store a
 | File | Job |
 | --- | --- |
 | `src/index.ts` | Routes. OAuth provider wiring, sign-in, pairing endpoints, `/debug`, cron. |
-| `src/auth.ts` | Who counts as the owner. Password by default, optional login service. Swap here for another identity provider. |
+| `src/auth.ts` | Who counts as the owner. Three modes: Google, a login service, or a password. |
+| `src/google.ts` | Google sign-in, token refresh, and reading contacts with phone-number normalization. |
 | `src/whatsapp-do.ts` | The Durable Object. Runs Baileys sessions, exposes RPC methods for the Worker. |
 | `src/store.ts` | Schema, ingesting Baileys events into SQLite, and every query. |
 | `src/auth-state.ts` | Baileys auth state backed by the DO's SQLite (replaces `useMultiFileAuthState`). |
@@ -169,8 +189,10 @@ These all cost real time to find. Read them before touching the Baileys parts.
 | Name | Kind | Purpose |
 | --- | --- | --- |
 | `OWNER_PASSWORD` | secret | Password mode (default). 12+ characters or sign-in refuses. |
+| `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET` | secrets | Set these to switch to Google mode. Takes priority over the other two modes. |
+| `OWNER_EMAIL` | var | Google and login-service modes: the one email allowed in. |
+| `DEFAULT_COUNTRY_CODE` | var, optional | Google mode: country code for contact numbers Google can't place, e.g. `972`. |
 | `LOGIN_ORIGIN` | var | Set this to switch to login-service mode. |
-| `OWNER_EMAIL` | var | Login-service mode: the one email allowed in. |
 | `ALLOWED_ORIGINS` | var | Login-service mode: comma-separated origins whose tokens are accepted. Production should list only production. |
 | `PIN` | secret, optional | 32+ random characters. Enables the `/debug` routes via an `x-pin` header. Leave it unset to leave them off. |
 | `OAUTH_KV` | binding | Token store for the OAuth provider and pending sign-ins. |
@@ -181,9 +203,9 @@ Keep a deployment's own values (domain, KV id, email) in `wrangler.local.jsonc`,
 ## Adapting it
 
 - **Add a tool.** Register it in `mcp.ts` and put the SQL in `store.ts`. Read tools should call `fresh()` first. Keep tools read-only unless you mean otherwise.
-- **Change who can sign in.** Replace the exports at the bottom of `auth.ts`: `tokenFromPassword`, `tokenFromLoginCode`, `isOwnerToken`. The rest of the code only sees an opaque bearer token.
+- **Change who can sign in.** `auth.ts` picks a mode (`authMode`) and the routes in `index.ts` follow it. To add another identity provider, add a mode there and a callback route. The rest of the code only sees an opaque bearer token.
 - **Make it multi-user.** Today the Durable Object is addressed by the fixed name `owner` (`wa()` in `index.ts`, `handleMcp` in `mcp.ts`), and `userId` is the constant `'owner'` in the OAuth props. To go multi-user, derive both from the signed-in identity and key the object on it. Think about whether you want to hold other people's message history first.
-- **Fill in missing names.** The obvious route is importing a Google Contacts CSV and matching on phone number into the `contacts` table (`upsertContacts` in `store.ts` already takes `{ id, name }`). A live Google Contacts sync needs its own OAuth grant with the contacts scope; note that Google expires refresh tokens after 7 days for apps left in "Testing".
+- **Contacts from somewhere else.** `google.ts` fetches names and `store.replaceGoogleContacts` keeps them in their own table, keyed by WhatsApp jid. Name resolution prefers WhatsApp's chat name, then WhatsApp's contact name, then the Google name, then the person's own push name, then the number. Another source (a CSV, CardDAV) only needs to produce `{ jid, name }` rows.
 - **Sending messages.** Not built, on purpose. Think hard before adding it.
 
 ## Debugging
@@ -193,6 +215,7 @@ With `PIN` set, these return JSON and need the header `x-pin: <PIN>`:
 - `/debug`: session phase, linked or not, counts, and the last events from the session (connection changes, history chunk sizes, errors).
 - `/debug/pull`: run a pull now.
 - `/debug/chats?q=`, `/debug/messages?chat=`, `/debug/search?q=`, `/debug/types`: read the store without going through MCP.
+- `/debug/contacts`: Google contacts status. Add `?sync=1` to run a sync now.
 - `/debug/logout`: the same as `relink`.
 
 Local development: `npm run dev` with a `.dev.vars` containing `OWNER_PASSWORD=...` (12+ characters). It runs a local Durable Object with its own empty storage, so you can exercise the sign-in flow and see a real QR code, but linking a phone from local dev makes a second linked device.
@@ -209,7 +232,8 @@ To test the pairing UI states without a phone, serve the page with a mocked `/pa
 
 ## Known gaps
 
-- Chats with no contact name show as phone numbers. See "Fill in missing names".
+- Chats with no name anywhere (not in WhatsApp, not in your Google contacts) show as phone numbers. Numbers Google stores without a country code need `DEFAULT_COUNTRY_CODE`.
+- Contacts access dies after 7 days if the Google app is left in "Testing". `link_status` reports it when the daily sync fails; signing in again fixes it.
 - If the daily pull finds the session logged out, nothing tells you. `link_status` shows it the next time your agent asks.
 - Edits and deletes are applied when they arrive as protocol messages. That path hasn't been tested against real ones.
 - It's only been exercised against one real account.

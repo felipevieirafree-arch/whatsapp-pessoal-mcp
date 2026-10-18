@@ -122,7 +122,13 @@ function buildServer(wa: DurableObjectStub<WhatsAppStore>, origin: string) {
       const i = await wa.linkInfo();
       if (!i.paired) return text(`Not linked. The owner needs to scan a QR code at ${origin}/setup.${i.messages ? ` The ${i.messages} messages already stored are kept.` : ''}`);
       const last = i.lastPull ? when(Math.floor(i.lastPull / 1000)) : 'never';
-      return text(`Linked. Last pull ${last}. Stored: ${i.messages} messages across ${i.chats} chats. To link a different phone or fix a broken session, call relink.`);
+      const c = await wa.contactsInfo();
+      const contacts = c.error
+        ? ` Google contacts: ${c.error}`
+        : c.connected
+          ? ` Google contacts: ${c.names} names matched${c.namedByGoogle ? `, naming ${c.namedByGoogle} chats WhatsApp had no name for` : ''}.`
+          : '';
+      return text(`Linked. Last pull ${last}. Stored: ${i.messages} messages across ${i.chats} chats.${contacts} To link a different phone or fix a broken session, call relink.`);
     },
   );
 
@@ -151,7 +157,8 @@ function buildServer(wa: DurableObjectStub<WhatsAppStore>, origin: string) {
       if (!(await wa.isPaired())) return text(`WhatsApp is not linked yet. Open ${origin}/setup to scan the QR code.`);
       const r = await wa.pull();
       const c = await wa.counts();
-      return text(`Pulled ${r.added} new messages in ${(r.ms / 1000).toFixed(1)}s (${r.reason}). Store now holds ${c.messages} messages across ${c.chats} chats.`);
+      const g = (await wa.contactsInfo()).connected ? await wa.syncContacts().then((x) => ` Google contacts refreshed (${x.contacts} numbers).`, (e) => ` Google contacts failed: ${e?.message ?? e}.`) : '';
+      return text(`Pulled ${r.added} new messages in ${(r.ms / 1000).toFixed(1)}s (${r.reason}). Store now holds ${c.messages} messages across ${c.chats} chats.${g}`);
     },
   );
 

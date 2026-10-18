@@ -13,6 +13,7 @@ export function initSchema(sql: SqlStorage) {
     CREATE INDEX IF NOT EXISTS messages_ts ON messages (ts);
     CREATE TABLE IF NOT EXISTS chats (jid TEXT PRIMARY KEY, name TEXT, is_group INTEGER NOT NULL DEFAULT 0);
     CREATE TABLE IF NOT EXISTS contacts (jid TEXT PRIMARY KEY, name TEXT, notify TEXT);
+    CREATE TABLE IF NOT EXISTS google_contacts (jid TEXT PRIMARY KEY, name TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS alias (lid TEXT PRIMARY KEY, pn TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT);
     CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(body, content='messages', content_rowid='rowid');
@@ -172,6 +173,27 @@ export class Store {
     });
   }
 
+  /** Replace the whole Google contacts snapshot. Keyed by WhatsApp jid, so matching is by phone number. */
+  replaceGoogleContacts(rows: { jid: string; name: string }[]) {
+    this.tx(() => {
+      this.sql.exec(`DELETE FROM google_contacts`);
+      for (const r of rows) this.sql.exec(`INSERT OR IGNORE INTO google_contacts (jid, name) VALUES (?, ?)`, r.jid, r.name);
+    });
+  }
+  googleContactCount(): number {
+    return this.sql.exec<{ n: number }>(`SELECT COUNT(*) n FROM google_contacts`).one().n;
+  }
+  /** Chats that now have a name only because of Google, for a sense of how much it helped. */
+  namedByGoogle(): number {
+    return this.sql
+      .exec<{ n: number }>(
+        `SELECT COUNT(*) n FROM chats c JOIN google_contacts gc ON gc.jid = c.jid
+         LEFT JOIN contacts ct ON ct.jid = c.jid
+         WHERE c.is_group = 0 AND c.name IS NULL AND ct.name IS NULL AND EXISTS (SELECT 1 FROM messages m WHERE m.chat = c.jid)`,
+      )
+      .one().n;
+  }
+
   setMeta(k: string, v: string) {
     this.sql.exec(`INSERT OR REPLACE INTO meta (k, v) VALUES (?, ?)`, k, v);
   }
@@ -189,7 +211,7 @@ export class Store {
 
   // ---------- queries ----------
 
-  private nameExpr = `COALESCE(ch.name, ct.name, ct.notify,
+  private nameExpr = `COALESCE(ch.name, ct.name, gc.name, ct.notify,
       (SELECT push_name FROM messages p WHERE p.chat = c.jid AND p.from_me = 0 AND p.push_name IS NOT NULL ORDER BY p.ts DESC LIMIT 1),
       c.jid)`;
 
@@ -200,7 +222,7 @@ export class Store {
     return this.sql
       .exec<{ jid: string; name: string }>(
         `SELECT c.jid, ${this.nameExpr} AS name FROM chats c
-         LEFT JOIN chats ch ON ch.jid = c.jid LEFT JOIN contacts ct ON ct.jid = c.jid
+         LEFT JOIN chats ch ON ch.jid = c.jid LEFT JOIN contacts ct ON ct.jid = c.jid LEFT JOIN google_contacts gc ON gc.jid = c.jid
          WHERE EXISTS (SELECT 1 FROM messages m WHERE m.chat = c.jid)
            AND (${this.nameExpr} LIKE ? OR c.jid LIKE ?)
          ORDER BY (SELECT MAX(ts) FROM messages m WHERE m.chat = c.jid) DESC LIMIT 10`,
@@ -214,7 +236,7 @@ export class Store {
       this.sql
         .exec<{ name: string }>(
           `SELECT ${this.nameExpr} AS name FROM (SELECT ? AS jid) c
-           LEFT JOIN chats ch ON ch.jid = c.jid LEFT JOIN contacts ct ON ct.jid = c.jid`,
+           LEFT JOIN chats ch ON ch.jid = c.jid LEFT JOIN contacts ct ON ct.jid = c.jid LEFT JOIN google_contacts gc ON gc.jid = c.jid`,
           jid,
         )
         .toArray()[0]?.name ?? jid
@@ -229,7 +251,7 @@ export class Store {
            SELECT c.jid AS jid, ${this.nameExpr} AS name, c.is_group AS is_group,
                   (SELECT COUNT(*) FROM messages m WHERE m.chat = c.jid) AS messages,
                   (SELECT MAX(ts) FROM messages m WHERE m.chat = c.jid) AS last_ts
-           FROM chats c LEFT JOIN chats ch ON ch.jid = c.jid LEFT JOIN contacts ct ON ct.jid = c.jid
+           FROM chats c LEFT JOIN chats ch ON ch.jid = c.jid LEFT JOIN contacts ct ON ct.jid = c.jid LEFT JOIN google_contacts gc ON gc.jid = c.jid
          ) WHERE messages > 0 AND (name LIKE ? OR jid LIKE ?)
          ORDER BY last_ts DESC LIMIT ?`,
         like, like, limit,
@@ -237,7 +259,7 @@ export class Store {
       .toArray();
   }
 
-  private senderName = `CASE WHEN m.from_me = 1 THEN 'Me' ELSE COALESCE(ct.name, ct.notify, m.push_name, '+' || replace(replace(m.sender, '@s.whatsapp.net', ''), '@lid', ''), 'unknown') END`;
+  private senderName = `CASE WHEN m.from_me = 1 THEN 'Me' ELSE COALESCE(ct.name, gc.name, ct.notify, m.push_name, '+' || replace(replace(m.sender, '@s.whatsapp.net', ''), '@lid', ''), 'unknown') END`;
 
   getMessages(opts: { chat: string; before?: number; after?: number; limit: number; newestFirst?: boolean }) {
     const where = [`m.chat = ?`];
@@ -249,7 +271,7 @@ export class Store {
     const rows = this.sql
       .exec(
         `SELECT m.id, m.ts, ${this.senderName} AS sender, m.type, m.body
-         FROM messages m LEFT JOIN contacts ct ON ct.jid = m.sender
+         FROM messages m LEFT JOIN contacts ct ON ct.jid = m.sender LEFT JOIN google_contacts gc ON gc.jid = m.sender
          WHERE ${where.join(' AND ')} ORDER BY m.ts ${order} LIMIT ?`,
         ...args, opts.limit,
       )
@@ -266,10 +288,10 @@ export class Store {
     return this.sql
       .exec(
         `SELECT m.id, m.chat, m.ts, ${this.senderName} AS sender, m.body,
-                (SELECT COALESCE(ch.name, ct2.name, ct2.notify, m.chat) FROM (SELECT m.chat AS jid) x
-                  LEFT JOIN chats ch ON ch.jid = x.jid LEFT JOIN contacts ct2 ON ct2.jid = x.jid) AS chat_name
+                (SELECT COALESCE(ch.name, ct2.name, gc2.name, ct2.notify, m.chat) FROM (SELECT m.chat AS jid) x
+                  LEFT JOIN chats ch ON ch.jid = x.jid LEFT JOIN contacts ct2 ON ct2.jid = x.jid LEFT JOIN google_contacts gc2 ON gc2.jid = x.jid) AS chat_name
          FROM messages_fts JOIN messages m ON m.rowid = messages_fts.rowid
-         LEFT JOIN contacts ct ON ct.jid = m.sender
+         LEFT JOIN contacts ct ON ct.jid = m.sender LEFT JOIN google_contacts gc ON gc.jid = m.sender
          WHERE ${where.join(' AND ')} ORDER BY m.ts DESC LIMIT ?`,
         ...args, opts.limit,
       )

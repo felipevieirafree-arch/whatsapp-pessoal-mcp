@@ -5,10 +5,11 @@ export function messagePage(title: string, text: string, status?: { href: string
   return page(title, `<h1>${esc(title)}</h1><p>${esc(text)}</p>${status ? `<a class="button" href="${esc(status.href)}">${esc(status.label)}</a>` : ''}`);
 }
 
-export function consentPage(clientName: string, signInUrl: string, label: string) {
+export function consentPage(clientName: string, signInUrl: string, label: string, note = '') {
   return page('Allow access', `
 <h1>Give ${esc(clientName)} read access?</h1>
 <p>It will be able to search and read your WhatsApp messages. It can't send or change anything.</p>
+${note ? `<p>${esc(note)}</p>` : ''}
 <a class="button" href="${esc(signInUrl)}">${esc(label)}</a>`);
 }
 
