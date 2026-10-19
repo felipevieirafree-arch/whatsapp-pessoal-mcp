@@ -28,36 +28,18 @@ const field = (id: string, label: string, input: string, hint = '') =>
 const formCss = `
 .field { margin: 0 0 18px; }
 .hint { margin: 6px 0 0; }
-.swap { margin-top: 26px; }
 `;
 
-/** `single` is a server for one person: no email, just the password they set up. */
-export function loginPage(action: string, o: { single: boolean; error?: string; email?: string; signupHref: string }) {
+/** The password page of a copy that has one person. Everyone else signs in with Google and never sees this. */
+export function loginPage(action: string, o: { error?: string }) {
   return page('Sign in', `
-<h1>${o.single ? 'Your password' : 'Sign in'}</h1>
+<h1>Your password</h1>
 <form method="post" action="${esc(action)}">
-  ${o.single ? '' : field('email', 'Email', `<input id="email" type="email" name="email" value="${esc(o.email ?? '')}" autocomplete="username" autofocus required>`)}
-  ${field('pw', o.single ? 'The password you set for this server' : 'Password',
-    `<input id="pw" type="password" name="password" autocomplete="current-password" ${o.single ? 'autofocus' : ''} required aria-describedby="${o.error ? 'e' : ''}">`)}
+  ${field('pw', 'The password you set for this server',
+    `<input id="pw" type="password" name="password" autocomplete="current-password" autofocus required aria-describedby="${o.error ? 'e' : ''}">`)}
   ${o.error ? `<p class="err" id="e" role="alert">${esc(o.error)}</p>` : ''}
   <button class="primary">Sign in</button>
-</form>
-${o.single ? '' : `<p class="muted swap">New here? <a href="${esc(o.signupHref)}">Create an account</a></p>`}`, { css: formCss });
-}
-
-export function signupPage(action: string, o: { error?: string; email?: string; needsCode: boolean; loginHref: string }) {
-  return page('Create an account', `
-<h1>Create an account</h1>
-<form method="post" action="${esc(action)}">
-  ${field('email', 'Email', `<input id="email" type="email" name="email" value="${esc(o.email ?? '')}" autocomplete="username" autofocus required>`,
-    'Only used to tell logins apart. Nothing is sent to it.')}
-  ${field('pw', 'Password', `<input id="pw" type="password" name="password" autocomplete="new-password" minlength="12" required aria-describedby="${o.error ? 'e' : ''}">`,
-    'At least 12 characters. It locks your messages, and nobody can reset it for you. If you lose it, you start again with a new link to WhatsApp.')}
-  ${o.needsCode ? field('code', 'Invite code', `<input id="code" name="code" autocomplete="off" required>`) : ''}
-  ${o.error ? `<p class="err" id="e" role="alert">${esc(o.error)}</p>` : ''}
-  <button class="primary">Create account</button>
-</form>
-<p class="muted swap">Already have one? <a href="${esc(o.loginHref)}">Sign in</a></p>`, { css: formCss });
+</form>`, { css: formCss });
 }
 
 const pairCss = `

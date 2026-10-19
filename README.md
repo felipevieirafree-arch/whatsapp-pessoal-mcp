@@ -9,7 +9,7 @@ Built by [@finereli](https://x.com/finereli). Questions and bug reports go in an
 There are two ways to use it:
 
 - **Run your own copy** in your Cloudflare account. This is what the setup guide below covers. Free apart from Cloudflare's few dollars a month.
-- **Use a hosted copy**, if someone runs one for you. You sign up with an email and a password, link your phone, and skip to "Connect your agent". See "Running it for other people" if you want to be that someone.
+- **Use a hosted copy**, if someone runs one for you. You sign in with Google, link your phone, and skip to "Connect your agent". See "Running it for other people" if you want to be that someone.
 
 Ask your agent things like:
 
@@ -23,29 +23,31 @@ Your phone stays the source of truth. The server is a linked device that your ag
 
 It doesn't stay connected to WhatsApp. When your agent asks for something, it connects, collects whatever WhatsApp queued for it since last time, writes that to its own database, and hangs up. Your phone keeps working normally and keeps getting notifications.
 
-Your messages live in a SQLite database inside a Durable Object in Cloudflare, one per person, sealed with a key that comes from that person's password.
+Your messages live in a SQLite database inside a Durable Object in Cloudflare, one per person, sealed with a key that comes from that person's sign-in.
 
 ## What it guarantees, and what it doesn't
 
 **It only reads.** There are no tools that send, edit or delete anything in WhatsApp.
 
-**Your messages are encrypted at rest, with a key only your password can make.**
+**Your messages are encrypted at rest. Whether the operator can read them depends on how it is run.**
+- **Your own copy** (`OWNER_PASSWORD`): the key comes from your password. There is no master key and no recovery key. Not Cloudflare, and not someone who copies the database, can read your stored messages without it.
+- **A hosted service** (`OPEN_SIGNUP`): people sign in with Google through a login service (login.finereli.com) that hands the server a key for them, the same key every time. A leaked database, a stolen backup or a peek inside the hosting account shows noise. The login service's operator can derive that key, so the encryption is not a lock against them. They say so, the code is open source, and running your own copy removes the question.
 - Each account has a random data key. It encrypts everything you own: message text, chat and contact names, the names your agent saves, and WhatsApp's session keys.
-- The data key is stored only in a form locked by your password (PBKDF2-SHA256, 600,000 rounds, then AES-256-GCM). There is no master key and no recovery key. Not the person running the server, not Cloudflare, and not someone who copies the database can read your stored messages without your password.
+- The data key is stored only in a form locked by that password or login key (PBKDF2-SHA256, 600,000 rounds for a password, then AES-256-GCM). Someone who copies the database can't read your stored messages without it.
 - Phone numbers and chat ids are replaced by keyed hashes in the database, so it can still sort and group without knowing who anyone is. Timestamps, message types and which side sent each message are left readable, and so is roughly how long each message is. Someone with the database could see how many chats you have, how active they are and when, but not who they were with or what they said.
 - Signing in produces the data key for a while. It travels inside the OAuth token your agent holds and your browser session, each encrypted under that token. The server stores nothing that can open your data on its own.
 
 **It is not end-to-end encryption, and you should know exactly where that stops.**
 - While you or your agent are making a request, the server has your key in memory and works with your messages in plain text.
-- Whoever runs the server could deploy modified code that captures passwords as people type them. The code is open source so that this can be checked, and you can run your own copy to remove the question.
+- Whoever runs the server could deploy modified code that captures passwords as people type them, or reads the key as it arrives. The code is open source so that this can be checked, and you can run your own copy to remove the question.
 - Whatever your agent reads goes to the company that runs the agent.
 - The server is itself a WhatsApp device that has to read your messages to answer your agent, so it has to see them in plain text. A design that kept them hidden from the server couldn't search them for you.
 
-**If you lose your password, the stored messages are gone.** Nobody can reset it. You link WhatsApp again and get whatever history WhatsApp sends.
+**If you lose your password (own copy), you lose the stored copy.** Nobody can reset it. Your messages are still in WhatsApp, so you link again and import whatever history WhatsApp sends. Signing in with Google has no password to lose.
 
 **You can delete everything.** "Delete my data" on the dashboard unlinks WhatsApp and erases your messages, names, keys and account, and disconnects every agent.
 
-**WhatsApp doesn't allow this.** It uses the same protocol as WhatsApp Web through an open source library (Baileys), which is against WhatsApp's terms. WhatsApp could restrict or close an account that does it. The risk for a read-only linked device is low, but it isn't zero. Use it on your own account, and don't use it to send messages.
+**WhatsApp discourages this.** It uses the same protocol as WhatsApp Web through an open source library (Baileys), and WhatsApp's terms discourage that. WhatsApp could restrict or close an account that does it. The risk for a read-only linked device is low, but it isn't zero. Use it on your own account, and don't use it to send messages.
 
 **The people in your chats didn't agree to this.** Their messages to you are in the copy too. It's your call whether you're comfortable with that.
 
@@ -79,6 +81,8 @@ Wrangler prints your URL, something like `https://whatsapp-mcp.your-name.workers
 
    Then type `/mcp`. ChatGPT calls an MCP server a connector; Grok and anything else that speaks MCP works the same way.
 
+   The front page also has Claude, ChatGPT and Grok buttons. Each copies a message ("Set up WhatsApp for me via your-url. Read your-url/llms.txt and walk me through it.") and opens the assistant, so you paste it there. `/llms.txt` is a plain-text page written for the assistant: where the MCP endpoint is, the steps the person has to do themselves, and what to tell them honestly.
+
 The first sign-in with `OWNER_PASSWORD` creates your account. After that your account's own password is what counts, so changing the secret later does nothing. If you want your own domain, see the comments at the bottom of `wrangler.jsonc`.
 
 ### The Workers Paid note
@@ -107,10 +111,12 @@ The first version stored messages in plain text. The first sign-in after you dep
 
 ## Running it for other people
 
-The same code runs as a service for many people. Leave `OWNER_PASSWORD` unset and turn signup on with `SIGNUP_CODE` (invite-only) or `OPEN_SIGNUP=true` (anyone). With none of the three set, nobody can sign in, so a deployment that forgot to choose can't become a free service for strangers. The front page then offers signup: an email and a password. The email only tells logins apart, nothing is ever sent to it, and the server keeps a hash of it rather than the address. Each person gets their own Durable Object, their own key, and no way to see anyone else's data.
+The same code runs as a service for many people. Leave `OWNER_PASSWORD` unset and set `OPEN_SIGNUP=true`. With neither set, nobody can sign in, so a deployment that forgot to choose can't become a free service for strangers. People sign in with Google through a login service (login.finereli.com by default; point `LOGIN_URL` at your own). The service says who they are and gives the server a data key for them, derived from a secret only the service holds, so there is no password to type or lose. The server keeps an anonymous id made from their Google account id, never their email. Each person gets their own Durable Object, their own key, and no way to see anyone else's data. The honest limit: whoever runs the login service can derive every key, so say so to your users, and know that this protects against leaks, not against you.
+
+The login service has to list your origin in its `ALLOWED_ORIGINS`, and it must return a key from `/exchange` when asked (`{code, key: true}`). Writing your own is small: the key is `HKDF-SHA256(secret, salt = your origin, info = the person's Google id)`, returned only to a server (never a browser), and the secret must never change.
 
 ```sh
-npx wrangler secret put SIGNUP_CODE   # invite-only. Or set the var OPEN_SIGNUP to "true" to let anyone in.
+# in wrangler.jsonc vars: "OPEN_SIGNUP": "true", "SIGNUP_LIMIT": "100", and "LOGIN_URL" if not finereli's
 ```
 
 Set `OPERATOR_NAME` so the privacy policy and terms say who runs it. Those pages describe what this code does, and their wording is not legal advice: have someone qualified read them before you offer this to the public.
@@ -170,7 +176,7 @@ Everything below is for whoever is changing the code, including an AI agent work
 ```
 MCP client ──OAuth──> Worker (src/index.ts)
                         ├─ /mcp ───────────> mcp.ts: tools, one fresh McpServer per request
-                        └─ /, /setup, /authorize, /login, /signup, /pair/*   (landing, sign-in, pairing UI)
+                        └─ /, /setup, /authorize, /login, /auth/callback, /pair/*   (landing, sign-in, pairing UI)
                                    │ RPC: unlock(dek), then the call
                                    v
               WhatsAppStore (Durable Object, one instance per person)
@@ -181,14 +187,14 @@ MCP client ──OAuth──> Worker (src/index.ts)
                               WhatsApp servers
 ```
 
-One Durable Object per person holds everything. Its SQLite is both the Baileys auth store and the message store. The object is named `owner` in single-user mode and by a hash of the email otherwise, so finding someone's object needs no directory. The Worker is stateless apart from a KV namespace: the OAuth provider's tokens, short-lived "pending sign-in" records, and browser sessions.
+One Durable Object per person holds everything. Its SQLite is both the Baileys auth store and the message store. The object is named `owner` in single-user mode and by a hash of the Google account id otherwise, so finding someone's object needs no directory. The Worker is stateless apart from a KV namespace: the OAuth provider's tokens, short-lived "pending sign-in" records, and browser sessions.
 
 ## How the key travels
 
 `vault.ts` is the only code that touches keys. Read it first.
 
-1. **Signup or first sign-in.** `createAccount` makes a random 32-byte data key (DEK), stretches the password with PBKDF2 into a key-encryption key and an auth key, wraps the DEK under the first and stores a hash of the second as a verifier. The account record (salt, rounds, verifier, wrapped DEK) goes in the person's Durable Object. It's useless without the password.
-2. **Sign-in.** `openAccount` checks the verifier and unwraps the DEK. Wrong passwords are throttled in the object (`noteLogin`): five in a row, then longer and longer waits. An unknown email spends the same time as a wrong password.
+1. **Signup or first sign-in.** `createAccount` makes a random 32-byte data key (DEK), stretches the password (or, for a login-service key, which is already random, not at all: `KEY_STRETCH`) with PBKDF2 into a key-encryption key and an auth key, wraps the DEK under the first and stores a hash of the second as a verifier. The account record (salt, rounds, verifier, wrapped DEK) goes in the person's Durable Object. It's useless without the password.
+2. **Sign-in.** `openAccount` checks the verifier and unwraps the DEK. Wrong passwords are throttled in the object (`noteLogin`): five in a row, then longer and longer waits. A missing account spends the same time as a wrong password. With the login service there is no password: `signInWithLogin` redeems the one-time code at the service, which returns the person's id and key, and opens or creates the account.
 3. **Carrying it.** The DEK goes into the OAuth grant's `props`, which `workers-oauth-provider` encrypts under a key wrapped by each access and refresh token. The browser gets a session: a random token filed in KV with the DEK sealed under a key derived from the token, so KV alone can't open it. The dashboard uses a second 30 minute token minted from the cookie.
 4. **Using it.** Every Worker to Durable Object call starts with `unlockedStub()`, which calls `unlock(dek)`. The object builds a `Vault`, checks it against a sealed canary in `meta` so a wrong key is refused, and keeps the key in memory only. It's gone when the object is evicted. Nothing writes it to disk or to logs.
 5. **Sealing.** `Vault.seal` is AES-256-GCM with a random nonce and an `aad` label naming what the blob is, so one kind can't be passed off as another. `Vault.pid` is an HMAC that turns a jid into an opaque, stable id.
@@ -199,12 +205,13 @@ Don't log a key, put one in a URL, or store one anywhere that outlives a session
 
 | File | Job |
 | --- | --- |
-| `src/index.ts` | Routes. OAuth provider wiring, sign-in and signup, pairing endpoints, deleting an account, `/debug`. |
+| `src/index.ts` | Routes. OAuth provider wiring, sign-in, pairing endpoints, deleting an account, `/debug`. |
 | `src/vault.ts` | Keys: password to account record, sealing and opening, pseudonymous ids, tokens that carry a key. |
-| `src/auth.ts` | Accounts and sessions. Single-user mode or many-user mode, sign-in and signup, the KV-backed sessions that carry the key. |
+| `src/auth.ts` | Accounts and sessions. Single-user mode or many-user mode, password sign-in and the login service, the KV-backed sessions that carry the key. |
 | `src/limits.ts` | The mode (one person, many, not set up) and the per-account size caps: what is over, and whether to turn an account away or stop adding to it. |
 | `src/registry.ts` | The seat counter behind `SIGNUP_LIMIT`. |
 | `src/notify.ts` | Posts a line of plain text to `NOTIFY_URL`. |
+| `src/brand.ts` | The logo as the Worker serves it: the SVG, the PNG icons and the social card, embedded so a deployment needs no static hosting. |
 | `src/phone.ts` | Phone numbers in any format to WhatsApp jids. |
 | `src/whatsapp-do.ts` | The Durable Object. Holds the account record, unlocks with a key, runs Baileys sessions, exposes RPC methods for the Worker. |
 | `src/store.ts` | Schema, ingesting Baileys events into SQLite, every query, the search scan, and the migration from the plaintext version. |
@@ -267,8 +274,8 @@ These all cost real time to find. Read them before touching the Baileys parts.
 | Name | Kind | Purpose |
 | --- | --- | --- |
 | `OWNER_PASSWORD` | secret | Single-user mode: set it and the server is for one person. 12+ characters. The first sign-in creates the account. Leave it unset for many-user mode. |
-| `SIGNUP_CODE` | secret, optional | Many-user mode: signup needs this code. Setting it (or `OPEN_SIGNUP`) is what turns many-user mode on. |
-| `OPEN_SIGNUP` | var, optional | `"true"` for many-user mode with no invite code. |
+| `OPEN_SIGNUP` | var, optional | `"true"` turns on many-user mode: Google sign-in through the login service. |
+| `LOGIN_URL` | var, optional | The login service. Defaults to `https://login.finereli.com`. |
 | `SIGNUP_LIMIT` | var, optional | Most accounts in many-user mode. Unset or `0`: no cap. |
 | `MAX_MESSAGES`, `MAX_DB_MB` | var, optional | Most messages and storage in one account. Defaults in many-user mode: 250000 and 300. `0` means no cap. |
 | `NOTIFY_URL` | secret, optional | A URL that takes a plain-text POST, such as an ntfy.sh topic. Used when seats run low and run out. |
@@ -286,7 +293,7 @@ Keep a deployment's own values (domain, KV id) in `wrangler.local.jsonc`, which 
 ## Adapting it
 
 - **Add a tool.** Register it in `mcp.ts` and put the SQL in `store.ts`. Read tools should call `fresh()` first. Keep tools read-only unless you mean otherwise. If a failure leaves an agent stuck, say in the tool result what to try next, the way `NAME_HINT` does for missing names.
-- **Change who can sign in.** `signIn` and `signUp` in `auth.ts` are the only places that turn a form into an identity. Anything you add has to produce the data key, which means it has to start from a secret only the person knows. A login service that proves an email can't do that on its own.
+- **Change who can sign in.** `signIn` and `signInWithLogin` in `auth.ts` are the only places that turn a login into an identity. Anything you add has to produce the data key, so it has to start from a secret: a password only the person knows, or a key a service derives for them (which the service's operator can derive too).
 - **Offer an opt-in background sync.** Today nothing can decrypt when nobody is signed in, so there is no scheduled pull. A "keep syncing" setting could store the data key wrapped by a server secret. That is a weaker mode and should be labeled as one. Don't make it the default.
 - **Add a way to change the password.** `rewrap` in `vault.ts` does the cryptography, and `replaceAccount` in the Durable Object stores the result. Nothing calls them yet.
 - **Other ways to fill in names.** Anything that can produce `{ jid, name }` rows can call `store.setCustomNames`. A CSV upload, a CardDAV pull or a scheduled job would all work. The agent route exists so the server needs no credentials for any of them.
@@ -313,8 +320,9 @@ To test the pairing UI states without a phone, serve the page with a mocked `/pa
 - Chats with no name in WhatsApp and none saved show as phone numbers. Nothing refreshes names by itself: they only get saved when an agent (or you) does it.
 - If WhatsApp has logged the device out, nothing tells you. `link_status` shows it the next time your agent asks.
 - Nothing changes a password yet (see "Adapting it").
-- Signup has no rate limit beyond the invite code, and there is no email verification or recovery by design.
-- Wrong-password lockouts are per account, so anyone who knows an email can lock that person out of signing in for up to an hour. Agents that are already connected keep working. Per-address limits would fix it and need more than the Worker knows today.
+- Signup is capped by `SIGNUP_LIMIT` and nothing else. Google proves the email, so there is no verification of our own.
+- The login service holds a master secret. Lose it and every hosted account is unreadable; leak it together with the database and every account is readable.
+- Wrong-password lockouts apply to the password mode only, per account, so someone who knows the owner's setup could lock the owner out of signing in for up to an hour. Agents that are already connected keep working.
 - Search scans everything. That's fine for a person's WhatsApp and wouldn't be for a company's archive.
 - Edits and deletes are applied when they arrive as protocol messages. That path hasn't been tested against real ones.
 - It's only been exercised against one real account.

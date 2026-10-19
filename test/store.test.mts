@@ -3,7 +3,7 @@ import { DatabaseSync } from 'node:sqlite';
 import { initSchema, isLegacy, migrateLegacy, parseQuery, Store } from '../src/store.ts';
 import { sqliteAuthState } from '../src/auth-state.ts';
 import { limitsOf, verdict } from '../src/limits.ts';
-import { createAccount, newToken, openAccount, rewrap, tokenId, unwrapForToken, Vault, wrapForToken } from '../src/vault.ts';
+import { createAccount, KEY_STRETCH, newToken, openAccount, rewrap, tokenId, unwrapForToken, Vault, wrapForToken } from '../src/vault.ts';
 
 // ---------- a SqlStorage lookalike ----------
 
@@ -38,6 +38,13 @@ const moved = await rewrap('correct horse battery', 'a brand new password', acct
 check('changing the password keeps the same key', (await openAccount('a brand new password', moved!))?.equals(acct.dek) === true);
 check('and the old password stops working', (await openAccount('correct horse battery', moved!)) === null);
 check('changing needs the old password', (await rewrap('nope nope nope', 'x', acct.record)) === null);
+
+// a key from the login service: already random, so it isn't stretched, and the same key opens the same account
+const loginKey = Buffer.from(crypto.getRandomValues(new Uint8Array(32))).toString('base64url');
+const keyed = await createAccount(loginKey, KEY_STRETCH);
+check('a login-service key opens its account', (await openAccount(loginKey, keyed.record))?.equals(keyed.dek) === true);
+check('another key does not', (await openAccount(loginKey.slice(1) + 'A', keyed.record)) === null);
+check('the key is not in the record', !JSON.stringify(keyed.record).includes(loginKey));
 
 const vault = new Vault(acct.dek);
 const other = new Vault((await createAccount('someone else entirely', FAST)).dek);

@@ -34,8 +34,9 @@
 
   // Sign-in. Pick one:
   //   - Just you: `npx wrangler secret put OWNER_PASSWORD` (12+ characters). The first sign-in creates your account.
-  //   - Many people: leave OWNER_PASSWORD unset and set `npx wrangler secret put SIGNUP_CODE` (invite-only)
-  //     or the var "OPEN_SIGNUP": "true" (anyone). People sign up with an email and password.
+  //   - Many people: leave OWNER_PASSWORD unset and set the var "OPEN_SIGNUP": "true". People sign in with Google
+  //     through a login service ("LOGIN_URL", default https://login.finereli.com) that also gives the server a
+  //     data key for them. The service's operator can derive those keys; see the README.
   //   With neither, nobody can sign in.
   //
   // Optional: your own domain instead of workers.dev.

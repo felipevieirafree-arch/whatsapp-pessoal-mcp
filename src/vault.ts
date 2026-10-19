@@ -3,9 +3,10 @@
  *
  * The model, in short:
  *   - Each account has a random data key (DEK). The DEK encrypts the user's data. It is never stored in the clear.
- *   - The password becomes a key-encryption key (KEK) through PBKDF2. The KEK wraps the DEK; only the wrapped
- *     copy is stored, in the account record. There is no master key anywhere, so without the password (or a
- *     live session that carries the DEK) the stored data is noise to everyone, including the operator.
+ *   - A secret becomes a key-encryption key (KEK) through PBKDF2. The KEK wraps the DEK; only the wrapped copy is
+ *     stored, in the account record. The secret is either a password (single-user copies: nothing else holds
+ *     it, so the stored data is noise to everyone, the operator included) or a key from the login service (many
+ *     users: the service's operator can derive it, but a leaked database or a look inside Cloudflare cannot).
  *   - A login yields the DEK for the length of a session. It rides inside the OAuth grant and the browser
  *     session, each encrypted under the token that holds it, and reaches the Durable Object with each request.
  *
@@ -18,6 +19,8 @@ const FORMAT = 1;
 const NONCE = 12;
 const TAG = 16;
 export const KDF_ITERATIONS = 600_000;
+/** A key handed over by the login service already has 256 bits of entropy, so there is nothing to stretch. */
+export const KEY_STRETCH = 1;
 
 const hmac = (key: Uint8Array, label: string) => createHmac('sha256', key).update(label).digest();
 const toBuf = (x: ArrayBuffer | Uint8Array) => (x instanceof Uint8Array ? Buffer.from(x.buffer, x.byteOffset, x.byteLength) : Buffer.from(x));

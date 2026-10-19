@@ -3,19 +3,20 @@
  *
  *   - Single user (set the OWNER_PASSWORD secret): one account named "owner", for people running their own copy.
  *     The first sign-in with OWNER_PASSWORD creates the account; after that the account's own password is what
- *     counts (it starts out the same).
- *   - Many users (leave OWNER_PASSWORD unset and set SIGNUP_CODE, or OPEN_SIGNUP=true): people sign up with an
- *     email and a password. The code keeps signups invite-only. The email is only a name for the login; nothing
- *     is ever sent to it.
+ *     counts (it starts out the same). The password is what unlocks the data (see vault.ts).
+ *   - Many users (leave OWNER_PASSWORD unset and set OPEN_SIGNUP=true): people sign in with Google through a
+ *     login service (finereli-login by default). The service says who they are and hands this server a data key
+ *     for them, the same on every login, so there is no password to type or lose. The catch is that the service's
+ *     operator can derive that key: the data is encrypted at rest, not hidden from whoever runs the service.
  *   - Neither: nobody can sign in. A fresh deployment that forgot to pick a mode must not turn into a free
  *     service for strangers.
  *
- * Either way a password is what unlocks the user's data (see vault.ts), so a sign-in produces the data key and
- * the key is carried from there inside tokens: the OAuth grant for agents, and a session for the browser. Both
- * keep it encrypted under the token itself, so the server stores nothing that can open a user's data on its own.
+ * Either way a sign-in produces the data key, and the key is carried from there inside tokens: the OAuth grant
+ * for agents, and a session for the browser. Both keep it encrypted under the token itself, so this server
+ * stores nothing that can open a user's data on its own.
  */
 import { createHash } from 'node:crypto';
-import { createAccount, newToken, openAccount, tokenId, unwrapForToken, wrapForToken } from './vault.js';
+import { createAccount, KEY_STRETCH, newToken, openAccount, tokenId, unwrapForToken, wrapForToken } from './vault.js';
 import type { AccountRecord } from './vault.js';
 import type { WhatsAppStore } from './whatsapp-do.js';
 import type { Registry } from './registry.js';
@@ -26,9 +27,10 @@ export interface AuthEnv {
   WA: DurableObjectNamespace<WhatsAppStore>;
   REGISTRY: DurableObjectNamespace<Registry>;
   OWNER_PASSWORD?: string;
-  SIGNUP_CODE?: string;
-  /** "true" to let anyone sign up when there is no SIGNUP_CODE. Many-user mode has to be asked for. */
+  /** "true" to run for many people, signing in through the login service. Many-user mode has to be asked for. */
   OPEN_SIGNUP?: string;
+  /** The login service that says who someone is and hands over their data key. Defaults to finereli's. */
+  LOGIN_URL?: string;
   /** Most accounts the service will have (many-user mode). 0 or unset: no cap. */
   SIGNUP_LIMIT?: string;
   /** A URL that takes a plain-text POST and pushes it to the operator's phone, such as an ntfy.sh topic. */
@@ -57,15 +59,12 @@ export async function sameSecret(a: string, b: string) {
 export const isSingleUser = (env: AuthEnv) => Boolean(env.OWNER_PASSWORD);
 export { serverMode };
 export type { Mode } from './limits.js';
-export const NOT_SET_UP = 'This server has no sign-in configured. Its owner needs to set OWNER_PASSWORD (for one person), or SIGNUP_CODE or OPEN_SIGNUP (for many).';
+export const NOT_SET_UP = 'This server has no sign-in configured. Its owner needs to set OWNER_PASSWORD (for one person), or OPEN_SIGNUP=true (for many).';
 export const MIN_PASSWORD = 12;
 
-const normEmail = (e: string) => e.trim().toLowerCase();
-const looksLikeEmail = (e: string) => e.length <= 254 && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(e);
-
-/** One Durable Object per person, found by a hash of their email. */
-export const userIdFor = (env: AuthEnv, email: string) =>
-  isSingleUser(env) ? 'owner' : createHash('sha256').update(`whatsapp-mcp:${normEmail(email)}`).digest('hex').slice(0, 32);
+/** One Durable Object per person. In many-user mode it is found by a hash of their Google id, so no email is kept. */
+export const userIdFor = (env: AuthEnv, sub?: string) =>
+  isSingleUser(env) ? 'owner' : createHash('sha256').update(`whatsapp-mcp:google:${sub ?? ''}`).digest('hex').slice(0, 32);
 
 export const seatRegistry = (env: AuthEnv) => env.REGISTRY.get(env.REGISTRY.idFromName('seats'));
 
@@ -97,58 +96,75 @@ export async function takePending(env: AuthEnv, id: string) {
   return p;
 }
 
-// ---------- passwords ----------
+// ---------- the single user's password ----------
 
 export type Attempt = { ok: true; who: Identity; seats?: { taken: number; limit: number } } | { ok: false; error: string; status: number; full?: boolean };
 const fail = (error: string, status = 401): Attempt => ({ ok: false, error, status });
 
 let decoy: AccountRecord | null = null;
 
-/** Check a login, creating the single user's account on its first sign-in. */
-export async function signIn(env: AuthEnv, form: { email?: string; password: string }, timezone: string): Promise<Attempt> {
+/** Check the single user's password, creating the account on its first sign-in. */
+export async function signIn(env: AuthEnv, form: { password: string }, timezone: string): Promise<Attempt> {
   const { password } = form;
-  if (serverMode(env) === 'unset') return fail(NOT_SET_UP, 503);
-  const single = isSingleUser(env);
-  if (!single && !looksLikeEmail(normEmail(form.email ?? ''))) return fail('Enter the email you signed up with.', 400);
-  const userId = userIdFor(env, form.email ?? '');
+  if (!isSingleUser(env)) return fail(serverMode(env) === 'unset' ? NOT_SET_UP : 'This server signs in with Google.', serverMode(env) === 'unset' ? 503 : 403);
+  const userId = userIdFor(env);
   const stub = accountStub(env, userId);
 
   const { record, retryAfter } = await stub.account();
   if (retryAfter > 0) return fail(`Too many wrong passwords. Try again in ${Math.ceil(retryAfter / 1000)} seconds.`, 429);
 
   if (!record) {
-    if (single && env.OWNER_PASSWORD!.length >= MIN_PASSWORD && (await sameSecret(password, env.OWNER_PASSWORD!))) {
+    if (env.OWNER_PASSWORD!.length >= MIN_PASSWORD && (await sameSecret(password, env.OWNER_PASSWORD!))) {
       const made = await createAccount(password);
       if (await stub.createAccount(made.record, env.TIMEZONE ?? timezone)) return { ok: true, who: { userId, dek: made.dek } };
       return signIn(env, form, timezone); // lost a race with another first sign-in; it exists now
     }
-    // Spend the same time as a real check, so an unknown email isn't distinguishable from a wrong password.
+    // Spend the same time as a real check, so a missing account isn't distinguishable from a wrong password.
     decoy ??= (await createAccount('decoy')).record;
     await openAccount(password, decoy);
-    if (single) await stub.noteLogin(false); // an unknown email has no object worth creating just to count its failures
-    return fail(single ? 'Wrong password.' : 'Wrong email or password.');
+    await stub.noteLogin(false);
+    return fail('Wrong password.');
   }
 
   const dek = await openAccount(password, record);
   await stub.noteLogin(Boolean(dek));
-  return dek ? { ok: true, who: { userId, dek } } : fail(single ? 'Wrong password.' : 'Wrong email or password.');
+  return dek ? { ok: true, who: { userId, dek } } : fail('Wrong password.');
 }
 
-export async function signUp(env: AuthEnv, form: { email: string; password: string; code?: string }, timezone: string): Promise<Attempt> {
+// ---------- signing in with the login service ----------
+
+export const loginService = (env: AuthEnv) => (env.LOGIN_URL ?? 'https://login.finereli.com').replace(/\/+$/, '');
+
+/** Where to send the browser: the login service, which returns to /auth/callback?p=<id> with a one-time code. */
+export const loginServiceUrl = (env: AuthEnv, origin: string, p: string) =>
+  `${loginService(env)}/start?return=${encodeURIComponent(`${origin}/auth/callback?p=${p}`)}`;
+
+/** Trade the one-time code for who the person is and their data key. Null if the code is no good. */
+export async function redeemLoginCode(env: AuthEnv, code: string): Promise<{ sub: string; key: string } | null> {
+  const res = await fetch(`${loginService(env)}/exchange`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ code, key: true }) });
+  if (!res.ok) return null;
+  const body = (await res.json()) as { key?: string; user?: { sub?: string } };
+  return body.key && body.user?.sub ? { sub: body.user.sub, key: body.key } : null;
+}
+
+/** A person the login service vouched for: open their account, or make one if they are new and there is room. */
+export async function signInWithLogin(env: AuthEnv, who: { sub: string; key: string }, timezone: string): Promise<Attempt> {
   if (serverMode(env) !== 'multi') return fail(isSingleUser(env) ? 'This server is for one person.' : NOT_SET_UP, 403);
-  const email = normEmail(form.email);
-  if (!looksLikeEmail(email)) return fail('That doesn\'t look like an email address.', 400);
-  if (form.password.length < MIN_PASSWORD) return fail(`Choose a password of at least ${MIN_PASSWORD} characters.`, 400);
-  if (env.SIGNUP_CODE && !(await sameSecret(form.code ?? '', env.SIGNUP_CODE))) return fail('That invite code isn\'t right.', 403);
+  const userId = userIdFor(env, who.sub);
+  const stub = accountStub(env, userId);
+  const { record } = await stub.account();
+  if (record) {
+    const dek = await openAccount(who.key, record);
+    return dek ? { ok: true, who: { userId, dek } } : fail('The login service gave a different key than this account was made with, so it can\'t be opened.', 403);
+  }
   const limit = Number(env.SIGNUP_LIMIT) > 0 ? Number(env.SIGNUP_LIMIT) : 0;
-  const registry = env.REGISTRY.get(env.REGISTRY.idFromName('seats'));
+  const registry = seatRegistry(env);
   const seat = await registry.claim(limit);
   if (!seat.ok) return { ok: false, error: `This service is full: it takes ${limit} people for now.`, status: 503, full: true };
-  const made = await createAccount(form.password);
-  const userId = userIdFor(env, email);
-  if (!(await accountStub(env, userId).createAccount(made.record, timezone))) {
-    await registry.release();
-    return fail('That email already has an account. Sign in instead.', 409);
+  const made = await createAccount(who.key, KEY_STRETCH);
+  if (!(await stub.createAccount(made.record, timezone))) {
+    await registry.release(); // lost a race with another first sign-in; it exists now
+    return signInWithLogin(env, who, timezone);
   }
   return { ok: true, who: { userId, dek: made.dek }, seats: { taken: seat.count, limit } };
 }
