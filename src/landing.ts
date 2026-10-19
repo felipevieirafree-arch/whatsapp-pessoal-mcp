@@ -25,12 +25,8 @@ const AGENTS = [
   { name: 'Grok', url: 'https://grok.com/', icon: grokIcon },
 ];
 
-/** Made-up examples. They show what talking to your own messages is like. */
-const SCENES = [
-  { q: 'When did Dana say the flights were booked?', found: 'Searched 2 chats', a: "Thursday evening. She wrote that she'd booked both flights and the confirmations were in your email." },
-  { q: 'What did I miss in the family group?', found: 'Read 41 new messages', a: "Mostly Mum's birthday. Dinner is Friday at 8, Noa is bringing the cake, and Dad still has to confirm the restaurant." },
-  { q: 'Every time someone mentioned the lease', found: 'Searched 6 chats', a: 'Three times. Yoni asked about the deposit on Monday, your landlord sent the signed copy on Tuesday, and Dana reminded you it renews in March.' },
-];
+/** A made-up example. It shows what talking to your own messages is like. */
+const SCENE = { q: 'When did Dana say the flights were booked?', found: 'Searched 2 chats', a: "Thursday evening. She wrote that she'd booked both flights and the confirmations were in your email." };
 
 const STATUS = 'Searching WhatsApp messages...';
 
@@ -74,7 +70,7 @@ export function landingPage(origin: string, hosted = false, caps: { signupLimit?
     : 'Connect ChatGPT, Claude or Grok to your WhatsApp. It runs in your own Cloudflare account.';
   const host = new URL(origin).host;
   const pasteMessage = `Set up WhatsApp for me via ${host}. Read ${origin}/llms.txt and walk me through it.`;
-  const first = SCENES[0];
+  const first = SCENE;
   const description = `${subline} Read-only, stored encrypted, open source.`;
   return `<!doctype html>
 <html lang="en">
@@ -134,6 +130,9 @@ h1 { font-size: clamp(2.6rem, 9vw, 4.2rem); margin-bottom: 14px; }
 .titlebar i:nth-child(2) { background: #febc2e; }
 .titlebar i:nth-child(3) { background: #28c840; }
 .titlebar b { flex: 1; text-align: center; margin-right: 47px; font: 600 0.82rem/1 ui-sans-serif, system-ui, sans-serif; color: var(--muted); }
+.empty { margin: auto; max-width: 20rem; text-align: center; display: grid; gap: 6px; color: var(--muted); transition: opacity .4s; }
+.empty b { color: var(--ink); font-weight: 600; font-size: 1.05rem; line-height: 1.35; }
+.empty.gone { opacity: 0; }
 .thread { flex: 1; min-height: 0; padding: 22px 20px 12px; display: flex; flex-direction: column; gap: 18px; overflow: hidden; }
 .msg { animation: rise .35s ease-out both; }
 .msg.me { align-self: flex-end; max-width: 86%; background: var(--mine); border-radius: 18px 18px 4px 18px; padding: 10px 15px; }
@@ -206,8 +205,7 @@ footer p { margin: 0; max-width: none; }
   <figure class="window" aria-label="An example of asking an assistant about WhatsApp messages">
     <div class="titlebar" aria-hidden="true"><i></i><i></i><i></i><b>Assistant</b></div>
     <div class="thread" id="thread" aria-hidden="true">
-      <div class="msg me">${esc(first.q)}</div>
-      <div class="msg ai"><div class="tool"><span class="tick">${checkIcon}</span>${esc(first.found)}</div><div class="answer">${esc(first.a)}</div></div>
+      <div class="empty" id="empty"><b>Your assistant can now search all your WhatsApp messages.</b><span>Ask it anything.</span></div>
     </div>
     <div class="composer" aria-hidden="true">
       <div class="field" id="field"><span id="typed"></span><span class="caret"></span><span class="ph">Ask about your WhatsApp...</span></div>
@@ -264,7 +262,7 @@ footer p { margin: 0; max-width: none; }
 </section>
 </main>
 <script>${copyScript}
-${landingScript(SCENES, pasteMessage)}
+${landingScript(SCENE, pasteMessage)}
 (function () {
   fetch(${JSON.stringify(REPO_API)}).then(function (r) { return r.ok ? r.json() : null; }).then(function (j) {
     if (!j || typeof j.stargazers_count !== 'number') return;
@@ -277,13 +275,13 @@ ${landingScript(SCENES, pasteMessage)}
 }
 
 /**
- * The chat plays a short scene on a loop: type the question, send it, wait while it searches, stream the answer.
- * With reduced motion it shows the first scene finished and stays still. The agent buttons copy the setup message.
+ * The chat plays one scene, once: type the question, send it, wait while it searches, stream the answer, then
+ * stop with the finished conversation on screen. With reduced motion it shows the finished scene straight away. The agent buttons copy the setup message.
  */
-function landingScript(scenes: typeof SCENES, pasteMessage: string): string {
+function landingScript(scene: typeof SCENE, pasteMessage: string): string {
   return `
 (function () {
-  var SCENES = ${JSON.stringify(scenes)}, STATUS = ${JSON.stringify(STATUS)}, CHECK = ${JSON.stringify(checkIcon)};
+  var SCENE = ${JSON.stringify(scene)}, STATUS = ${JSON.stringify(STATUS)}, CHECK = ${JSON.stringify(checkIcon)};
   var MESSAGE = ${JSON.stringify(pasteMessage)};
   var $ = function (id) { return document.getElementById(id); };
 
@@ -309,7 +307,16 @@ function landingScript(scenes: typeof SCENES, pasteMessage: string): string {
 
   // ---- the chat ----
   var thread = $('thread'), typed = $('typed'), field = $('field'), send = $('send');
-  if (!thread || matchMedia('(prefers-reduced-motion: reduce)').matches) return;
+  if (!thread) return;
+  var empty = $('empty');
+  function el(cls, html) { var d = document.createElement('div'); d.className = cls; if (html) d.innerHTML = html; return d; }
+  function esc(s) { return s.replace(/[&<>]/g, function (c) { return { '&': '&amp;', '<': '&lt;', '>': '&gt;' }[c]; }); }
+  if (matchMedia('(prefers-reduced-motion: reduce)').matches) {
+    thread.innerHTML = '';
+    thread.appendChild(el('msg me', esc(SCENE.q)));
+    thread.appendChild(el('msg ai', '<div class="tool"><span class="tick">' + CHECK + '</span>' + esc(SCENE.found) + '</div><div class="answer">' + esc(SCENE.a) + '</div>'));
+    return;
+  }
 
   var sleep = function (ms) { return new Promise(function (r) { setTimeout(r, ms); }); };
   var seen = true;
@@ -317,11 +324,9 @@ function landingScript(scenes: typeof SCENES, pasteMessage: string): string {
   // wait while the tab is hidden or the chat is off screen, so it doesn't run its clock for nobody
   var visible = function () { return new Promise(function (r) { (function check() { (!document.hidden && seen) ? r() : setTimeout(check, 300); })(); }); };
   var pause = function (ms) { return visible().then(function () { return sleep(ms); }); };
-  function el(cls, html) { var d = document.createElement('div'); d.className = cls; if (html) d.innerHTML = html; return d; }
-  function esc(s) { return s.replace(/[&<>]/g, function (c) { return { '&': '&amp;', '<': '&lt;', '>': '&gt;' }[c]; }); }
 
   async function play(s) {
-    thread.innerHTML = ''; typed.textContent = ''; field.className = 'field live'; send.className = 'send';
+    typed.textContent = ''; field.className = 'field live'; send.className = 'send';
     await pause(900);
     for (var i = 0; i < s.q.length; i++) {
       typed.textContent += s.q[i]; field.className = 'field live has'; send.className = 'send on';
@@ -330,6 +335,7 @@ function landingScript(scenes: typeof SCENES, pasteMessage: string): string {
     await pause(520);
     send.className = 'send on press'; await pause(150);
     typed.textContent = ''; field.className = 'field'; send.className = 'send';
+    empty.className = 'empty gone'; await pause(400); thread.removeChild(empty);
     thread.appendChild(el('msg me', esc(s.q)));
     await pause(650);
     var ai = el('msg ai'), tool = el('tool', '<span class="spin"></span><span class="t">' + esc(STATUS) + '</span>'), ans = el('answer');
@@ -342,8 +348,7 @@ function landingScript(scenes: typeof SCENES, pasteMessage: string): string {
       var w = document.createElement('span'); w.className = 'w'; w.textContent = (j ? ' ' : '') + words[j]; ans.appendChild(w);
       await pause(55 + Math.random() * 45);
     }
-    await pause(4200);
   }
-  (async function loop() { for (var n = 0; ; n = (n + 1) % SCENES.length) await play(SCENES[n]); })();
+  play(SCENE);
 })();`;
 }
