@@ -1,27 +1,63 @@
 /** The pages a person sees while signing in and linking their phone. */
-import { esc, page } from './ui.js';
+import { esc, page, xLink } from './ui.js';
 
 export function messagePage(title: string, text: string, status?: { href: string; label: string }) {
   return page(title, `<h1>${esc(title)}</h1><p>${esc(text)}</p>${status ? `<a class="button" href="${esc(status.href)}">${esc(status.label)}</a>` : ''}`);
 }
 
-export function consentPage(clientName: string, signInUrl: string, label: string) {
+export function consentPage(clientName: string, signInUrl: string) {
   return page('Allow access', `
 <h1>Give ${esc(clientName)} read access?</h1>
 <p>It will be able to search and read your WhatsApp messages, and to save names for phone numbers. It can't send anything.</p>
-<a class="button" href="${esc(signInUrl)}">${esc(label)}</a>
+<a class="button" href="${esc(signInUrl)}">Continue</a>
 <p class="muted" style="margin-top:20px"><a href="/privacy">Privacy policy</a> and <a href="/tos">terms of service</a></p>`);
 }
 
-export function loginPage(action: string, error?: string) {
-  return page('Owner password', `
-<h1>Owner password</h1>
+/** Shown to someone who tries to sign up after the cap. */
+export function fullPage(limit: number, contact?: string) {
+  return page('Full for now', `
+<h1>Full for now</h1>
+<p>This service takes ${limit ? `${limit.toLocaleString()} people` : 'a limited number of people'} while it is new, and they're all here.</p>
+<p>${contact ? `Message ${xLink(contact)} on X and I'll let you know when there's room. ` : ''}You can also run your own copy, which has no limit: <a href="https://github.com/finereli/whatsapp-mcp">the setup guide</a> takes a few minutes.</p>
+<p class="muted"><a href="/">Back</a></p>`);
+}
+
+const field = (id: string, label: string, input: string, hint = '') =>
+  `<div class="field"><label for="${id}">${label}</label>${input}${hint ? `<p class="muted hint">${hint}</p>` : ''}</div>`;
+
+const formCss = `
+.field { margin: 0 0 18px; }
+.hint { margin: 6px 0 0; }
+.swap { margin-top: 26px; }
+`;
+
+/** `single` is a server for one person: no email, just the password they set up. */
+export function loginPage(action: string, o: { single: boolean; error?: string; email?: string; signupHref: string }) {
+  return page('Sign in', `
+<h1>${o.single ? 'Your password' : 'Sign in'}</h1>
 <form method="post" action="${esc(action)}">
-  <label for="pw">The password you set for this server</label>
-  <input id="pw" type="password" name="password" autocomplete="current-password" autofocus required aria-describedby="${error ? 'e' : ''}">
-  ${error ? `<p class="err" id="e" role="alert" style="margin:10px 0 0">${esc(error)}</p>` : ''}
-  <button class="primary">Continue</button>
-</form>`);
+  ${o.single ? '' : field('email', 'Email', `<input id="email" type="email" name="email" value="${esc(o.email ?? '')}" autocomplete="username" autofocus required>`)}
+  ${field('pw', o.single ? 'The password you set for this server' : 'Password',
+    `<input id="pw" type="password" name="password" autocomplete="current-password" ${o.single ? 'autofocus' : ''} required aria-describedby="${o.error ? 'e' : ''}">`)}
+  ${o.error ? `<p class="err" id="e" role="alert">${esc(o.error)}</p>` : ''}
+  <button class="primary">Sign in</button>
+</form>
+${o.single ? '' : `<p class="muted swap">New here? <a href="${esc(o.signupHref)}">Create an account</a></p>`}`, { css: formCss });
+}
+
+export function signupPage(action: string, o: { error?: string; email?: string; needsCode: boolean; loginHref: string }) {
+  return page('Create an account', `
+<h1>Create an account</h1>
+<form method="post" action="${esc(action)}">
+  ${field('email', 'Email', `<input id="email" type="email" name="email" value="${esc(o.email ?? '')}" autocomplete="username" autofocus required>`,
+    'Only used to tell logins apart. Nothing is sent to it.')}
+  ${field('pw', 'Password', `<input id="pw" type="password" name="password" autocomplete="new-password" minlength="12" required aria-describedby="${o.error ? 'e' : ''}">`,
+    'At least 12 characters. It locks your messages, and nobody can reset it for you. If you lose it, you start again with a new link to WhatsApp.')}
+  ${o.needsCode ? field('code', 'Invite code', `<input id="code" name="code" autocomplete="off" required>`) : ''}
+  ${o.error ? `<p class="err" id="e" role="alert">${esc(o.error)}</p>` : ''}
+  <button class="primary">Create account</button>
+</form>
+<p class="muted swap">Already have one? <a href="${esc(o.loginHref)}">Sign in</a></p>`, { css: formCss });
 }
 
 const pairCss = `
@@ -125,18 +161,37 @@ function importScreen(s) {
   el('count').textContent = s.messages ? fmt(s.messages) + ' messages from ' + fmt(s.chats) + ' chats' + (typeof s.progress === 'number' ? ' (' + s.progress + '%)' : '') : 'Waiting for WhatsApp to send your history...';
 }
 
+function rejectedScreen(s) {
+  var lim = s.limits.messages ? fmt(s.limits.messages) + ' messages' : s.limits.mb + ' MB';
+  var dm = s.contact ? ' Message <a href="https://x.com/' + s.contact + '" rel="noopener">@' + s.contact + '</a> on X and we can talk about it.' : '';
+  if (!screen('rejected',
+    '<h1>Your history is too big for this service</h1>' +
+    '<p>WhatsApp sent more than this service takes (' + lim + '). Nothing was kept: what arrived has been deleted and your phone is unlinked.</p>' +
+    '<p>You can run your own copy, which has no limit: <a href="https://github.com/finereli/whatsapp-mcp">the setup guide</a> takes a few minutes.' + dm + '</p>' +
+    '<div class="quiet"><div class="row" id="relinkRow"><button class="text" id="erase" type="button">Delete my account</button><a href="/signout">Sign out</a></div></div>')) return;
+  wireErase();
+}
+
+function wireErase() {
+  el('erase').onclick = function () {
+    el('relinkRow').innerHTML = '<span>Delete every message and your account? This can\\'t be undone.</span> <button class="primary" id="yes" type="button">Delete everything</button> <button class="text" id="no" type="button">Cancel</button>';
+    el('no').onclick = function () { view = ''; };
+    el('yes').onclick = function () { this.disabled = true; this.textContent = 'Deleting...'; post('/pair/delete').then(function () { location.href = '/signout'; }); };
+  };
+}
+
 function doneScreen(s) {
   if (REQ) { screen('finishing', '<h1>' + tickIcon + 'Linked</h1><p>Finishing sign-in...</p>'); return finish(); }
   var cmd = 'claude mcp add --transport http whatsapp ' + location.origin + '/mcp';
   if (!screen('done',
     '<h1>' + tickIcon + 'WhatsApp is linked</h1>' +
-    '<p class="stat" id="summary"></p><p class="muted" id="unnamed"></p>' +
+    '<p class="stat" id="summary"></p><p class="err" id="fullnote"></p><p class="muted" id="unnamed"></p>' +
     '<div class="section"><h2>Connect your agent</h2>' +
     '<p>In Claude Code, run this, then type <code>/mcp</code> and sign in:</p>' +
     '<div class="cmd"><code id="cmd"></code><button id="copy" type="button">Copy</button></div>' +
     '<p class="muted">Other MCP clients: point them at <code id="url"></code>.</p></div>' +
     '<div class="quiet"><div class="row" id="relinkRow"><button class="text" id="relink" type="button">Unlink and scan again</button>' +
-    '<a href="/signout">Sign out</a></div></div>')) { summarize(s); return; }
+    '<button class="text" id="erase" type="button">Delete my data</button><a href="/signout">Sign out</a></div></div>')) { summarize(s); return; }
   summarize(s);
   el('cmd').textContent = cmd; el('url').textContent = location.origin + '/mcp';
   el('copy').onclick = function () {
@@ -149,10 +204,12 @@ function doneScreen(s) {
     el('no').onclick = function () { view = ''; };
     el('yes').onclick = function () { this.disabled = true; this.textContent = 'Unlinking...'; post('/pair/relink').then(function () { location.reload(); }); };
   };
+  wireErase();
 }
 
 function summarize(s) {
   el('summary').textContent = fmt(s.messages) + ' messages from ' + fmt(s.chats) + ' chats are stored and ready.';
+  el('fullnote').innerHTML = s.full ? 'This account has reached the size limit for this service, so new messages are no longer being added.' + (s.contact ? ' Message <a href="https://x.com/' + s.contact + '" rel="noopener">@' + s.contact + '</a> on X.' : '') : '';
   el('unnamed').textContent = s.unnamed ? fmt(s.unnamed) + ' chats are known only by phone number. Ask your agent to find their names in your contacts.' : '';
 }
 
@@ -166,7 +223,8 @@ function finish() {
 
 function tick() {
   get('/pair/status').then(function (s) {
-    if (s.paired && s.running) importScreen(s);
+    if (s.rejected) rejectedScreen(s);
+    else if (s.paired && s.running) importScreen(s);
     else if (s.paired) doneScreen(s);
     else {
       if (mode === 'qr') { qrScreen(); var q = el('qr'); if (q && s.qrSvg) q.innerHTML = s.qrSvg; }

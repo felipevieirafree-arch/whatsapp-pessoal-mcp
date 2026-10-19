@@ -2,15 +2,13 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { WebStandardStreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js';
 import { z } from 'zod';
-import type { Env } from './index.js';
+import type { Env, McpProps } from './index.js';
 import type { WhatsAppStore } from './whatsapp-do.js';
+import { unlockedStub } from './auth.js';
 import { toJid } from './phone.js';
 
-const TZ = 'Asia/Jerusalem';
 const STALE_MS = 10 * 60_000;
 
-const fmt = new Intl.DateTimeFormat('sv-SE', { timeZone: TZ, dateStyle: 'short', timeStyle: 'short' });
-const when = (ts: number) => fmt.format(new Date(ts * 1000));
 const epoch = (s?: string) => {
   if (!s) return undefined;
   const t = Date.parse(s);
@@ -35,12 +33,14 @@ type Rows = Record<string, any>[];
 
 const displayNumber = (jid: string) => (jid.endsWith('@s.whatsapp.net') ? `+${jid.replace('@s.whatsapp.net', '')}` : jid);
 
-function buildServer(wa: DurableObjectStub<WhatsAppStore>, env: Env, origin: string) {
+function buildServer(wa: DurableObjectStub<WhatsAppStore>, env: Env, origin: string, TZ: string) {
+  const fmt = new Intl.DateTimeFormat('sv-SE', { timeZone: TZ, dateStyle: 'short', timeStyle: 'short' });
+  const when = (ts: number) => fmt.format(new Date(ts * 1000));
   const server = new McpServer(
     { name: 'whatsapp-mcp', version: '0.0.1' },
     {
       instructions:
-        `Access to the owner's WhatsApp history. It can read and search messages and save names for phone numbers; it cannot send anything. Timestamps are ${TZ}. ` +
+        `Access to the user's WhatsApp history. It can read and search messages and save names for phone numbers; it cannot send anything. Timestamps are ${TZ}. ` +
         `Each read first pulls anything new from WhatsApp if the store is more than a few minutes old. ` +
         `Use list_chats to find a chat, get_messages to read it, search_messages to find things across chats. ${NAME_HINT}`,
     },
@@ -105,17 +105,22 @@ function buildServer(wa: DurableObjectStub<WhatsAppStore>, env: Env, origin: str
     'search_messages',
     {
       description:
-        'Full-text search across all messages (or one chat), newest matches first. ' +
-        'To find everything with a person, use list_chats to get their chat. If nobody by that name exists, see unnamed_chats.',
+        'Search all messages (or one chat) for words, newest matches first. Words are matched whole, ignoring case and accents; several words must all appear; ' +
+        '"quoted words" must appear together in order; a trailing * matches word starts (flight* finds flights). ' +
+        'Messages are stored encrypted, so each search decrypts the history, which takes a few seconds. Put every search you need in `queries` ' +
+        'and the cost is paid once for all of them. To find everything with a person, use list_chats to get their chat. If nobody by that name exists, see unnamed_chats.',
       inputSchema: {
-        query: z.string(),
+        queries: z.array(z.string()).min(1).max(20).optional().describe('Several searches at once. Results come back grouped by query.'),
+        query: z.string().optional().describe('One search. Same as queries with a single item.'),
         chat: z.string().optional().describe('Restrict to one chat (jid or name fragment)'),
         since: z.string().optional(),
         until: z.string().optional(),
-        limit: z.number().int().min(1).max(200).default(30),
+        limit: z.number().int().min(1).max(200).default(30).describe('Most matches to return for each query'),
       },
     },
-    async ({ query, chat, since, until, limit }) => {
+    async ({ queries, query, chat, since, until, limit }) => {
+      const qs = [...(queries ?? []), ...(query ? [query] : [])].filter((q) => q.trim());
+      if (!qs.length) return text('Give at least one search in `queries`.');
       const note = await fresh();
       let chatJid: string | undefined;
       if (chat) {
@@ -123,9 +128,11 @@ function buildServer(wa: DurableObjectStub<WhatsAppStore>, env: Env, origin: str
         if (!m.length) return text(note + `No chat matches "${chat}". ${NAME_HINT}`);
         chatJid = m[0].jid;
       }
-      const rows = (await wa.search({ query, chat: chatJid, since: epoch(since), until: epoch(until), limit })) as Rows;
-      if (!rows.length) return text(note + `No matches. If you were looking for something a particular person said, they may be saved only as a number. ${NAME_HINT}`);
-      return text(note + rows.map((r) => `[${when(r.ts)}] ${r.chat_name} | ${r.sender}: ${clip(r.body)}`).join('\n'));
+      const { hits } = await wa.search({ queries: qs, chat: chatJid, since: epoch(since), until: epoch(until), limit });
+      const lines = (rows: typeof hits[number]) => rows.map((r) => `[${when(r.ts)}] ${r.chat_name} | ${r.sender}: ${clip(r.body)}`).join('\n');
+      const none = `No matches. If you were looking for something a particular person said, they may be saved only as a number. ${NAME_HINT}`;
+      if (qs.length === 1) return text(note + (hits[0].length ? lines(hits[0]) : none));
+      return text(note + qs.map((q, i) => `## ${q} (${hits[i].length} match${hits[i].length === 1 ? '' : 'es'})\n${hits[i].length ? lines(hits[i]) : 'No matches.'}`).join('\n\n'));
     },
   );
 
@@ -204,10 +211,14 @@ function buildServer(wa: DurableObjectStub<WhatsAppStore>, env: Env, origin: str
     },
     async () => {
       const i = await wa.linkInfo();
+      const dm = i.contact ? ` The operator is @${i.contact} on X.` : '';
+      if (i.rejected) {
+        return text(`Not linked. This history was larger than the service takes (${i.rejected.messages.toLocaleString()} messages; the limit is ${i.limits.messages ? `${i.limits.messages.toLocaleString()} messages` : `${i.limits.mb} MB`}), so it was not kept and the phone was unlinked. Nothing is stored.${dm}`);
+      }
       if (!i.paired) return text(`Not linked. The owner needs to scan a QR code at ${origin}/setup.${i.messages ? ` The ${i.messages} messages already stored are kept.` : ''}`);
       const last = i.lastPull ? when(Math.floor(i.lastPull / 1000)) : 'never';
       const unnamed = i.unnamed ? ` ${i.unnamed} chats are known only by phone number (see unnamed_chats).` : '';
-      return text(`Linked. Last pull ${last}. Stored: ${i.messages} messages across ${i.chats} chats.${unnamed} To link a different phone or fix a broken session, call relink.`);
+      return text(`Linked. Last pull ${last}. Stored: ${i.messages} messages across ${i.chats} chats.${unnamed} ${i.full ? ` This account has reached the size limit, so new messages are no longer being added.${dm}` : ''} To link a different phone or fix a broken session, call relink.`);
     },
   );
 
@@ -243,9 +254,9 @@ function buildServer(wa: DurableObjectStub<WhatsAppStore>, env: Env, origin: str
   return server;
 }
 
-export async function handleMcp(request: Request, env: Env): Promise<Response> {
-  const wa = env.WA.get(env.WA.idFromName('owner'));
-  const server = buildServer(wa, env, new URL(request.url).origin);
+export async function handleMcp(request: Request, env: Env, who: McpProps): Promise<Response> {
+  const wa = await unlockedStub(env, who);
+  const server = buildServer(wa, env, new URL(request.url).origin, await wa.timezone());
   const transport = new WebStandardStreamableHTTPServerTransport({ sessionIdGenerator: undefined, enableJsonResponse: true });
   await server.connect(transport);
   return transport.handleRequest(request);

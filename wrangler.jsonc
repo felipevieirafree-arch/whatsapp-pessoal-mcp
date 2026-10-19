@@ -15,8 +15,12 @@
   "rules": [{ "type": "CompiledWasm", "globs": ["**/*.wasm"], "fallthrough": true }],
 
   // One Durable Object holds the linked WhatsApp session and the message store (its SQLite).
-  "durable_objects": { "bindings": [{ "name": "WA", "class_name": "WhatsAppStore" }] },
-  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["WhatsAppStore"] }],
+  // The registry counts accounts, so signups can be capped. Only many-user mode uses it.
+  "durable_objects": { "bindings": [{ "name": "WA", "class_name": "WhatsAppStore" }, { "name": "REGISTRY", "class_name": "Registry" }] },
+  "migrations": [
+    { "tag": "v1", "new_sqlite_classes": ["WhatsAppStore"] },
+    { "tag": "v2", "new_sqlite_classes": ["Registry"] }
+  ],
 
   // The OAuth provider's token store. Create it, then paste the id:
   //   npx wrangler kv namespace create OAUTH_KV
@@ -25,14 +29,23 @@
   // First history import decodes a lot of protobuf; the default CPU budget is too small. Needs Workers Paid.
   "limits": { "cpu_ms": 300000 },
 
-  // Daily pull, so WhatsApp's per-device queue never goes stale.
-  "triggers": { "crons": ["0 4 * * *"] }
+  // There is no daily pull: messages are encrypted with a key that exists only while someone is signed in,
+  // so syncing happens when an agent asks (see "Things to know" in the README).
 
-  // Sign-in defaults to a password: `npx wrangler secret put OWNER_PASSWORD` (12+ characters).
+  // Sign-in. Pick one:
+  //   - Just you: `npx wrangler secret put OWNER_PASSWORD` (12+ characters). The first sign-in creates your account.
+  //   - Many people: leave OWNER_PASSWORD unset and set `npx wrangler secret put SIGNUP_CODE` (invite-only)
+  //     or the var "OPEN_SIGNUP": "true" (anyone). People sign up with an email and password.
+  //   With neither, nobody can sign in.
   //
   // Optional: your own domain instead of workers.dev.
   //   "routes": [{ "pattern": "whatsapp.example.com", "custom_domain": true }],
   //
-  // Optional: sign in through a Google login service instead of a password.
-  //   "vars": { "LOGIN_ORIGIN": "https://login.example.com", "OWNER_EMAIL": "you@example.com", "ALLOWED_ORIGINS": "https://whatsapp.example.com" }
+  // Many-user mode only:
+  //   "SIGNUP_LIMIT": "100"          most accounts. Deleting an account frees its seat.
+  //   "MAX_MESSAGES": "250000"       most messages in one account (these are the defaults; "0" means no cap)
+  //   "MAX_DB_MB": "300"             most storage in one account
+  //   secret NOTIFY_URL              an ntfy.sh topic URL: you get a push when seats are nearly gone and when they are
+  //
+  // Optional: "vars": { "TIMEZONE": "Europe/Lisbon", "OPERATOR_NAME": "Your name", "CONTACT_X": "yourhandle", "DEFAULT_COUNTRY_CODE": "351" }
 }

@@ -1,32 +1,52 @@
 /**
- * Who counts as the owner. Two ways in, picked by config:
+ * Who someone is, and how their data key travels with them. Two modes, picked by config:
  *
- *   - Password (default): set the OWNER_PASSWORD secret. Simple, works on any domain.
- *   - Login service: set LOGIN_ORIGIN (plus OWNER_EMAIL and ALLOWED_ORIGINS) to sign in through a
- *     Google login service that mints signed tokens, verified in verify-login.ts.
+ *   - Single user (set the OWNER_PASSWORD secret): one account named "owner", for people running their own copy.
+ *     The first sign-in with OWNER_PASSWORD creates the account; after that the account's own password is what
+ *     counts (it starts out the same).
+ *   - Many users (leave OWNER_PASSWORD unset and set SIGNUP_CODE, or OPEN_SIGNUP=true): people sign up with an
+ *     email and a password. The code keeps signups invite-only. The email is only a name for the login; nothing
+ *     is ever sent to it.
+ *   - Neither: nobody can sign in. A fresh deployment that forgot to pick a mode must not turn into a free
+ *     service for strangers.
  *
- * Either way the result is an opaque bearer token the pairing page presents to /pair/*, and a
- * cookie that lets the owner's browser skip signing in again for a while. To use a different
- * identity provider, add a mode here and a callback route in index.ts.
+ * Either way a password is what unlocks the user's data (see vault.ts), so a sign-in produces the data key and
+ * the key is carried from there inside tokens: the OAuth grant for agents, and a session for the browser. Both
+ * keep it encrypted under the token itself, so the server stores nothing that can open a user's data on its own.
  */
-import { verifyLoginToken } from './verify-login.js';
+import { createHash } from 'node:crypto';
+import { createAccount, newToken, openAccount, tokenId, unwrapForToken, wrapForToken } from './vault.js';
+import type { AccountRecord } from './vault.js';
+import type { WhatsAppStore } from './whatsapp-do.js';
+import type { Registry } from './registry.js';
+import { serverMode } from './limits.js';
 
 export interface AuthEnv {
   OAUTH_KV: KVNamespace;
+  WA: DurableObjectNamespace<WhatsAppStore>;
+  REGISTRY: DurableObjectNamespace<Registry>;
   OWNER_PASSWORD?: string;
-  LOGIN_ORIGIN?: string;
-  OWNER_EMAIL?: string;
-  ALLOWED_ORIGINS?: string;
+  SIGNUP_CODE?: string;
+  /** "true" to let anyone sign up when there is no SIGNUP_CODE. Many-user mode has to be asked for. */
+  OPEN_SIGNUP?: string;
+  /** Most accounts the service will have (many-user mode). 0 or unset: no cap. */
+  SIGNUP_LIMIT?: string;
+  /** A URL that takes a plain-text POST and pushes it to the operator's phone, such as an ntfy.sh topic. */
+  NOTIFY_URL?: string;
+  /** The operator's X handle, shown where people are told to get in touch. */
+  CONTACT_X?: string;
+  /** Per-account caps for many-user mode (see limits.ts). 0 means no cap. */
+  MAX_MESSAGES?: string;
+  MAX_DB_MB?: string;
+  /** IANA zone for the single user's timestamps. Defaults to the zone of the browser that first signed in. */
+  TIMEZONE?: string;
 }
+
+export interface Identity { userId: string; dek: Buffer }
 
 const enc = new TextEncoder();
 const hex = (b: ArrayBuffer) => [...new Uint8Array(b)].map((x) => x.toString(16).padStart(2, '0')).join('');
 const randomId = () => hex(crypto.getRandomValues(new Uint8Array(16)).buffer);
-
-async function hmac(key: string, msg: string) {
-  const k = await crypto.subtle.importKey('raw', enc.encode(key), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
-  return hex(await crypto.subtle.sign('HMAC', k, enc.encode(msg)));
-}
 
 /** Constant-time string comparison (hash both sides first so lengths don't leak). */
 export async function sameSecret(a: string, b: string) {
@@ -34,16 +54,37 @@ export async function sameSecret(a: string, b: string) {
   return (crypto.subtle as any).timingSafeEqual(x, y) as boolean;
 }
 
-export const usesLoginService = (env: AuthEnv) => Boolean(env.LOGIN_ORIGIN);
+export const isSingleUser = (env: AuthEnv) => Boolean(env.OWNER_PASSWORD);
+export { serverMode };
+export type { Mode } from './limits.js';
+export const NOT_SET_UP = 'This server has no sign-in configured. Its owner needs to set OWNER_PASSWORD (for one person), or SIGNUP_CODE or OPEN_SIGNUP (for many).';
+export const MIN_PASSWORD = 12;
+
+const normEmail = (e: string) => e.trim().toLowerCase();
+const looksLikeEmail = (e: string) => e.length <= 254 && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(e);
+
+/** One Durable Object per person, found by a hash of their email. */
+export const userIdFor = (env: AuthEnv, email: string) =>
+  isSingleUser(env) ? 'owner' : createHash('sha256').update(`whatsapp-mcp:${normEmail(email)}`).digest('hex').slice(0, 32);
+
+export const seatRegistry = (env: AuthEnv) => env.REGISTRY.get(env.REGISTRY.idFromName('seats'));
+
+export const accountStub = (env: AuthEnv, userId: string) => env.WA.get(env.WA.idFromName(userId));
+
+/** The same stub, unlocked with the person's data key. */
+export async function unlockedStub(env: AuthEnv, who: Identity | { userId: string; dek: string }) {
+  const stub = accountStub(env, who.userId);
+  await stub.unlock(typeof who.dek === 'string' ? who.dek : who.dek.toString('base64'));
+  return stub;
+}
+
+// ---------- sign-in steps that wait on a page ----------
 
 /** Park what we need after sign-in, and return the URL that starts it. */
 export async function startSignIn(env: AuthEnv, origin: string, pending: { oauth?: unknown }): Promise<string> {
   const id = randomId();
   await env.OAUTH_KV.put(`pending:${id}`, JSON.stringify(pending), { expirationTtl: 3600 });
-  if (!usesLoginService(env)) return `${origin}/login/password?p=${id}`;
-  const start = new URL('/start', env.LOGIN_ORIGIN);
-  start.searchParams.set('return', `${origin}/login/return?p=${id}`);
-  return start.toString();
+  return `${origin}/login?p=${id}`;
 }
 
 export async function peekPending(env: AuthEnv, id: string): Promise<{ oauth?: any } | null> {
@@ -56,85 +97,87 @@ export async function takePending(env: AuthEnv, id: string) {
   return p;
 }
 
-// ---------- password mode ----------
+// ---------- passwords ----------
 
-/** A 30 minute bearer token for the pairing page (password mode). */
-export async function mintToken(env: AuthEnv): Promise<string | null> {
-  const key = env.OWNER_PASSWORD;
-  if (!key || key.length < 12) return null;
-  const exp = String(Date.now() + 30 * 60_000);
-  return `${exp}.${await hmac(key, `pair:${exp}`)}`;
-}
+export type Attempt = { ok: true; who: Identity; seats?: { taken: number; limit: number } } | { ok: false; error: string; status: number; full?: boolean };
+const fail = (error: string, status = 401): Attempt => ({ ok: false, error, status });
 
-/** A good password buys a pairing token. */
-export async function tokenFromPassword(env: AuthEnv, password: string): Promise<string | null> {
-  const secret = env.OWNER_PASSWORD;
-  if (!secret || secret.length < 12 || !(await sameSecret(password, secret))) return null;
-  return mintToken(env);
-}
+let decoy: AccountRecord | null = null;
 
-// ---------- login service mode ----------
+/** Check a login, creating the single user's account on its first sign-in. */
+export async function signIn(env: AuthEnv, form: { email?: string; password: string }, timezone: string): Promise<Attempt> {
+  const { password } = form;
+  if (serverMode(env) === 'unset') return fail(NOT_SET_UP, 503);
+  const single = isSingleUser(env);
+  if (!single && !looksLikeEmail(normEmail(form.email ?? ''))) return fail('Enter the email you signed up with.', 400);
+  const userId = userIdFor(env, form.email ?? '');
+  const stub = accountStub(env, userId);
 
-/** Trade the one-time code from the return URL for a signed token, if it is the owner's. */
-export async function tokenFromLoginCode(env: AuthEnv, origin: string, code: string): Promise<string | null> {
-  const res = await fetch(`${env.LOGIN_ORIGIN}/exchange`, {
-    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ code }),
-  }).catch(() => null);
-  const token = res?.ok ? ((await res.json()) as { token?: string }).token : undefined;
-  return token && (await isOwnerToken(env, origin, token)) ? token : null;
-}
+  const { record, retryAfter } = await stub.account();
+  if (retryAfter > 0) return fail(`Too many wrong passwords. Try again in ${Math.ceil(retryAfter / 1000)} seconds.`, 429);
 
-/** Does this bearer token belong to the owner, on this origin? */
-export async function isOwnerToken(env: AuthEnv, origin: string, token: string | undefined): Promise<boolean> {
-  if (!token) return false;
-  if (!usesLoginService(env)) {
-    const [exp, sig] = token.split('.');
-    if (!exp || !sig || Number(exp) < Date.now() || !env.OWNER_PASSWORD) return false;
-    return sameSecret(sig, await hmac(env.OWNER_PASSWORD, `pair:${exp}`));
+  if (!record) {
+    if (single && env.OWNER_PASSWORD!.length >= MIN_PASSWORD && (await sameSecret(password, env.OWNER_PASSWORD!))) {
+      const made = await createAccount(password);
+      if (await stub.createAccount(made.record, env.TIMEZONE ?? timezone)) return { ok: true, who: { userId, dek: made.dek } };
+      return signIn(env, form, timezone); // lost a race with another first sign-in; it exists now
+    }
+    // Spend the same time as a real check, so an unknown email isn't distinguishable from a wrong password.
+    decoy ??= (await createAccount('decoy')).record;
+    await openAccount(password, decoy);
+    if (single) await stub.noteLogin(false); // an unknown email has no object worth creating just to count its failures
+    return fail(single ? 'Wrong password.' : 'Wrong email or password.');
   }
-  // tokens only count on the origin they were minted for
-  if (!(env.ALLOWED_ORIGINS ?? '').split(',').includes(origin) || !env.OWNER_EMAIL) return false;
-  const claims = await verifyLoginToken(token, { audience: origin, issuer: env.LOGIN_ORIGIN });
-  return Boolean(claims?.email_verified && claims.email.toLowerCase() === env.OWNER_EMAIL.toLowerCase());
+
+  const dek = await openAccount(password, record);
+  await stub.noteLogin(Boolean(dek));
+  return dek ? { ok: true, who: { userId, dek } } : fail(single ? 'Wrong password.' : 'Wrong email or password.');
 }
 
-// ---------- the owner's browser session ----------
+export async function signUp(env: AuthEnv, form: { email: string; password: string; code?: string }, timezone: string): Promise<Attempt> {
+  if (serverMode(env) !== 'multi') return fail(isSingleUser(env) ? 'This server is for one person.' : NOT_SET_UP, 403);
+  const email = normEmail(form.email);
+  if (!looksLikeEmail(email)) return fail('That doesn\'t look like an email address.', 400);
+  if (form.password.length < MIN_PASSWORD) return fail(`Choose a password of at least ${MIN_PASSWORD} characters.`, 400);
+  if (env.SIGNUP_CODE && !(await sameSecret(form.code ?? '', env.SIGNUP_CODE))) return fail('That invite code isn\'t right.', 403);
+  const limit = Number(env.SIGNUP_LIMIT) > 0 ? Number(env.SIGNUP_LIMIT) : 0;
+  const registry = env.REGISTRY.get(env.REGISTRY.idFromName('seats'));
+  const seat = await registry.claim(limit);
+  if (!seat.ok) return { ok: false, error: `This service is full: it takes ${limit} people for now.`, status: 503, full: true };
+  const made = await createAccount(form.password);
+  const userId = userIdFor(env, email);
+  if (!(await accountStub(env, userId).createAccount(made.record, timezone))) {
+    await registry.release();
+    return fail('That email already has an account. Sign in instead.', 409);
+  }
+  return { ok: true, who: { userId, dek: made.dek }, seats: { taken: seat.count, limit } };
+}
+
+// ---------- sessions: a token that carries the key ----------
+
+const SESSION_KEY = 'sess:';
+
+/** File the identity under a fresh token. The token is the only thing that can open the stored copy of the key. */
+export async function mintSession(env: AuthEnv, who: Identity, ttlSeconds: number): Promise<string> {
+  const { token, id } = newToken();
+  await env.OAUTH_KV.put(SESSION_KEY + id, JSON.stringify({ u: who.userId, k: wrapForToken(token, who.dek) }), { expirationTtl: Math.max(60, ttlSeconds) });
+  return token;
+}
+
+export async function readSession(env: AuthEnv, token: string | undefined): Promise<Identity | null> {
+  if (!token) return null;
+  const raw = await env.OAUTH_KV.get(SESSION_KEY + tokenId(token));
+  if (!raw) return null;
+  const { u, k } = JSON.parse(raw) as { u: string; k: string };
+  const dek = unwrapForToken(token, k);
+  return dek ? { userId: u, dek } : null;
+}
+
+// ---------- the browser ----------
 
 export const SESSION_COOKIE = 'wa_session';
-const PASSWORD_SESSION_SECONDS = 14 * 86_400;
-
-/**
- * What to remember in the owner's browser after a good sign-in. In login service mode that is the
- * service's own token, which is already signed and expires on its own clock. In password mode it's
- * a signed expiry. Null when there is nothing to remember.
- */
-export async function mintSession(env: AuthEnv, signInToken: string): Promise<{ value: string; maxAge: number } | null> {
-  if (usesLoginService(env)) {
-    try {
-      const exp = JSON.parse(atob(signInToken.split('.')[1].replace(/-/g, '+').replace(/_/g, '/'))).exp as number;
-      const maxAge = Math.min(Math.floor(exp - Date.now() / 1000), 30 * 86_400);
-      return maxAge > 0 ? { value: signInToken, maxAge } : null;
-    } catch {
-      return null;
-    }
-  }
-  const key = env.OWNER_PASSWORD;
-  if (!key || key.length < 12) return null;
-  const exp = String(Date.now() + PASSWORD_SESSION_SECONDS * 1000);
-  return { value: `${exp}.${await hmac(key, `session:${exp}`)}`, maxAge: PASSWORD_SESSION_SECONDS };
-}
-
-/** If the cookie is a valid owner session, the bearer token the dashboard should use. Otherwise null. */
-export async function sessionToken(env: AuthEnv, origin: string, cookie: string | undefined): Promise<string | null> {
-  if (!cookie) return null;
-  if (usesLoginService(env)) return (await isOwnerToken(env, origin, cookie)) ? cookie : null;
-  const key = env.OWNER_PASSWORD;
-  const [exp, sig] = cookie.split('.');
-  if (!key || !exp || !sig || Number(exp) < Date.now()) return null;
-  return (await sameSecret(sig, await hmac(key, `session:${exp}`))) ? mintToken(env) : null;
-}
+export const COOKIE_SECONDS = 14 * 86_400;
+export const PAGE_SECONDS = 30 * 60;
 
 export const sessionCookie = (value: string, maxAge: number) =>
   `${SESSION_COOKIE}=${value}; Path=/; Max-Age=${maxAge}; HttpOnly; Secure; SameSite=Lax`;
-
-export const signInLabel = (env: AuthEnv) => (usesLoginService(env) ? 'Sign in to allow' : 'Continue');

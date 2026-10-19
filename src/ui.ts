@@ -2,6 +2,15 @@
 
 export const esc = (s: string) => s.replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' })[c]!);
 
+/** An X handle is letters, digits and underscores, at most 15. Anything else is dropped, since it ends up in HTML and URLs. */
+export const xHandle = (v?: string): string | undefined => {
+  const h = (v ?? '').trim().replace(/^@/, '');
+  return /^[A-Za-z0-9_]{1,15}$/.test(h) ? h : undefined;
+};
+/** " DM @name on X (link)." if the operator gave a handle, else nothing. */
+export const contactText = (v?: string) => { const h = xHandle(v); return h ? ` DM @${h} on X (https://x.com/${h}).` : ''; };
+export const xLink = (handle: string) => `<a href="https://x.com/${handle}" rel="noopener">@${handle}</a>`;
+
 export const baseCss = `
 :root {
   --fog: #eef1f3; --ink: #14212b; --muted: #55656f; --rule: #cbd5db;

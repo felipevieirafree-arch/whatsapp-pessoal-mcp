@@ -1,17 +1,25 @@
-/** Baileys auth state backed by the Durable Object's SQLite, replacing useMultiFileAuthState. */
+/** Baileys auth state backed by the Durable Object's SQLite, replacing useMultiFileAuthState. Sealed with the user's Vault. */
 import { initAuthCreds, BufferJSON, proto } from '@whiskeysockets/baileys';
 import type { AuthenticationCreds, AuthenticationState, SignalDataTypeMap } from '@whiskeysockets/baileys';
+import type { Vault } from './vault.js';
 
-export function sqliteAuthState(sql: SqlStorage) {
-  sql.exec(`CREATE TABLE IF NOT EXISTS auth (k TEXT PRIMARY KEY, v TEXT NOT NULL)`);
+const AAD = 'a';
+
+/**
+ * Session keys are named after the people they talk to (`session-<number>.0`), so the names are pseudonyms
+ * too, not just the values. `onPaired` hears when the link appears or goes away, so a caller can remember it
+ * without a key.
+ */
+export function sqliteAuthState(sql: SqlStorage, vault: Vault, onPaired: (paired: boolean) => void = () => {}) {
+  const row = (k: string) => vault.pid('auth', k);
 
   const read = (k: string) => {
-    const row = sql.exec<{ v: string }>(`SELECT v FROM auth WHERE k = ?`, k).toArray()[0];
-    return row ? JSON.parse(row.v, BufferJSON.reviver) : null;
+    const r = sql.exec<{ data: ArrayBuffer }>(`SELECT data FROM auth WHERE k = ?`, row(k)).toArray()[0];
+    return r ? JSON.parse(vault.open<string>(r.data, AAD), BufferJSON.reviver) : null;
   };
   const write = (k: string, value: unknown) =>
-    sql.exec(`INSERT OR REPLACE INTO auth (k, v) VALUES (?, ?)`, k, JSON.stringify(value, BufferJSON.replacer));
-  const remove = (k: string) => sql.exec(`DELETE FROM auth WHERE k = ?`, k);
+    sql.exec(`INSERT OR REPLACE INTO auth (k, data) VALUES (?, ?)`, row(k), vault.seal(JSON.stringify(value, BufferJSON.replacer), AAD));
+  const remove = (k: string) => sql.exec(`DELETE FROM auth WHERE k = ?`, row(k));
 
   const creds: AuthenticationCreds = read('creds') ?? initAuthCreds();
 
@@ -38,16 +46,20 @@ export function sqliteAuthState(sql: SqlStorage) {
     },
   };
 
+  // QR pairing never sets `registered` (that's the mobile flow); `me` is the signal
+  const isPaired = () => Boolean(creds.me?.id);
+  onPaired(isPaired());
+
   return {
     state,
-    saveCreds: async () => write('creds', creds),
+    saveCreds: async () => { write('creds', creds); onPaired(isPaired()); },
     clear: () => {
       sql.exec(`DELETE FROM auth`);
       // Baileys holds this object; reset it in place so a fresh pairing starts clean
       for (const k of Object.keys(creds)) delete (creds as any)[k];
       Object.assign(creds, initAuthCreds());
+      onPaired(false);
     },
-    // QR pairing never sets `registered` (that's the mobile flow); `me` is the signal
-    isPaired: () => Boolean(creds.me?.id),
+    isPaired,
   };
 }

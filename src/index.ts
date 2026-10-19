@@ -1,30 +1,33 @@
 /**
  * whatsapp-mcp - a read-only MCP server over your own WhatsApp history.
  *
- * OAuth (workers-oauth-provider) fronts /mcp. Approving a client means signing in
- * as the owner (see auth.ts); if WhatsApp isn't linked yet, the same flow continues
- * into the pairing screen, so a first connection links the phone and a later one
- * just signs in.
+ * OAuth (workers-oauth-provider) fronts /mcp. Approving a client means signing in (see auth.ts); if WhatsApp
+ * isn't linked yet, the same flow continues into the pairing screen, so a first connection links the phone and
+ * a later one just signs in. Each person's messages live in their own Durable Object, sealed with a key that
+ * only their password can produce.
  */
 import './polyfills.js';
 import { OAuthProvider } from '@cloudflare/workers-oauth-provider';
 import type { OAuthHelpers } from '@cloudflare/workers-oauth-provider';
 import { WhatsAppStore } from './whatsapp-do.js';
 import { handleMcp } from './mcp.js';
-import { consentPage, loginPage, messagePage, pairPage } from './pages.js';
+import { consentPage, fullPage, loginPage, messagePage, pairPage, signupPage } from './pages.js';
+import { limitsOf } from './limits.js';
+import { notify } from './notify.js';
+import { xHandle } from './ui.js';
 import { landingPage } from './landing.js';
 import { privacyPage } from './privacy.js';
 import { tosPage } from './tos.js';
 import {
-  isOwnerToken, mintSession, peekPending, sessionCookie, sessionToken, SESSION_COOKIE, signInLabel, startSignIn,
-  takePending, tokenFromLoginCode, tokenFromPassword, usesLoginService,
-  type AuthEnv,
+  accountStub, COOKIE_SECONDS, isSingleUser, mintSession, NOT_SET_UP, seatRegistry, serverMode, PAGE_SECONDS, peekPending, readSession, sessionCookie, SESSION_COOKIE,
+  signIn, signUp, startSignIn, takePending, unlockedStub,
+  type AuthEnv, type Identity,
 } from './auth.js';
 
 export { WhatsAppStore };
+export { Registry } from './registry.js';
 
 export interface Env extends AuthEnv {
-  WA: DurableObjectNamespace<WhatsAppStore>;
   OAUTH_PROVIDER: OAuthHelpers;
   /** Optional secret for machine access to /debug. 32+ random characters. */
   PIN?: string;
@@ -34,14 +37,17 @@ export interface Env extends AuthEnv {
   DEFAULT_COUNTRY_CODE?: string;
 }
 
+/** What an agent's token carries: who, and the key that opens their data. Encrypted by the OAuth library under the token. */
+export interface McpProps { userId: string; dek: string }
+
 const html = (body: string, status = 200) => new Response(body, { status, headers: { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store' } });
 const json = (data: unknown, status = 200) => Response.json(data, { status, headers: { 'cache-control': 'no-store' } });
-const wa = (env: Env) => env.WA.get(env.WA.idFromName('owner'));
 const b64 = (o: unknown) => btoa(JSON.stringify(o));
 const unb64 = (s: string) => JSON.parse(atob(s));
 const cookieValue = (r: Request, name: string) => r.headers.get('cookie')?.split(/;\s*/).find((c) => c.startsWith(`${name}=`))?.slice(name.length + 1);
 const bearer = (r: Request) => r.headers.get('authorization')?.match(/^Bearer\s+(.+)$/i)?.[1];
 const plain = (title: string, msg: string, status: number) => html(messagePage(title, msg), status);
+const zone = (r: Request) => ((r as any).cf?.timezone as string | undefined) ?? 'UTC';
 
 function pinOk(request: Request, env: Env) {
   const sent = request.headers.get('x-pin');
@@ -51,125 +57,139 @@ function pinOk(request: Request, env: Env) {
   return diff === 0;
 }
 
-async function completeOauth(env: Env, oauth: unknown) {
+async function completeOauth(env: Env, oauth: unknown, who: Identity) {
+  const props: McpProps = { userId: who.userId, dek: who.dek.toString('base64') };
   const { redirectTo } = await env.OAUTH_PROVIDER.completeAuthorization({
-    request: oauth as any, userId: 'owner', scope: ['whatsapp'], metadata: {}, props: { userId: 'owner' },
+    request: oauth as any, userId: who.userId, scope: ['whatsapp'], metadata: {}, props,
   });
   return redirectTo;
 }
 
-/** The owner is verified. Remember this browser, then finish the MCP grant if WhatsApp is linked, else go on to pairing. */
-async function proceed(env: Env, pendingId: string, token: string): Promise<Response> {
+/** Signed in. Remember this browser, then finish the MCP grant if WhatsApp is linked, else go on to pairing. */
+async function proceed(env: Env, pendingId: string, who: Identity): Promise<Response> {
   const pending = await takePending(env, pendingId);
   if (!pending) return plain('Sign-in expired', 'Start again from the app that asked.', 400);
-  const session = await mintSession(env, token);
+  const cookie = await mintSession(env, who, COOKIE_SECONDS);
   const remember = (res: Response) => {
     const out = new Response(res.body, res);
-    if (session) out.headers.append('set-cookie', sessionCookie(session.value, session.maxAge));
+    out.headers.append('set-cookie', sessionCookie(cookie, COOKIE_SECONDS));
     return out;
   };
-  if (pending.oauth && (await wa(env).isPaired())) return remember(new Response(null, { status: 302, headers: { location: await completeOauth(env, pending.oauth) } }));
-  return remember(html(pairPage(token, pending.oauth ? b64(pending.oauth) : null)));
+  if (pending.oauth && (await (await unlockedStub(env, who)).isPaired())) {
+    return remember(new Response(null, { status: 302, headers: { location: await completeOauth(env, pending.oauth, who) } }));
+  }
+  const pageToken = await mintSession(env, who, PAGE_SECONDS);
+  return remember(html(pairPage(pageToken, pending.oauth ? b64(pending.oauth) : null)));
 }
 
-const signedInToken = (request: Request, env: Env, origin: string) => sessionToken(env, origin, cookieValue(request, SESSION_COOKIE));
+/** Tell the operator when signups get close to the cap, and when they hit it. */
+async function milestone(env: Env, taken: number, limit: number) {
+  if (!limit) return;
+  if (taken === limit) await notify(env, 'whatsapp-mcp is full', `All ${limit} seats are taken. Signups are closed until someone leaves or you raise SIGNUP_LIMIT.`);
+  else if (limit >= 5 && taken === Math.ceil(limit * 0.8)) await notify(env, 'whatsapp-mcp is filling up', `${taken} of ${limit} seats are taken.`);
+}
 
 const ownerHandler = {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
     const path = url.pathname;
     const p = url.searchParams.get('p') ?? '';
+    const single = isSingleUser(env);
+    const hosted = serverMode(env) === 'multi';
+    const contact = xHandle(env.CONTACT_X);
+    const signupLimit = Number(env.SIGNUP_LIMIT) > 0 ? Number(env.SIGNUP_LIMIT) : 0;
 
-    // The owner, signed in, lands on their dashboard. Everyone else gets the front page.
+    // Someone signed in lands on their dashboard. Everyone else gets the front page.
     if (path === '/') {
-      const token = await signedInToken(request, env, url.origin);
-      return html(token ? pairPage(token, null) : landingPage(url.origin));
+      const who = await readSession(env, cookieValue(request, SESSION_COOKIE));
+      return html(who ? pairPage(await mintSession(env, who, PAGE_SECONDS), null) : landingPage(url.origin, hosted, { signupLimit, maxMessages: limitsOf(env).messages, contact }));
     }
-    if (path === '/privacy') return html(privacyPage(env.OPERATOR_NAME));
-    if (path === '/tos') return html(tosPage(env.OPERATOR_NAME));
+    if (path === '/privacy') return html(privacyPage(env.OPERATOR_NAME, hosted, contact));
+    if (path === '/tos') return html(tosPage(env.OPERATOR_NAME, hosted, contact));
     if (path === '/signout') return new Response(null, { status: 302, headers: { location: '/', 'set-cookie': sessionCookie('', 0) } });
 
-    // An MCP client wants in: show who is asking, then send the owner to sign in.
+    // An MCP client wants in: show who is asking, then send the person to sign in.
     if (path === '/authorize') {
       const oauth = await env.OAUTH_PROVIDER.parseAuthRequest(request);
       const client = await env.OAUTH_PROVIDER.lookupClient(oauth.clientId);
-      return html(consentPage(client?.clientName ?? 'An app', await startSignIn(env, url.origin, { oauth }), signInLabel(env)));
+      return html(consentPage(client?.clientName ?? 'An app', await startSignIn(env, url.origin, { oauth })));
     }
     if (path === '/setup') {
-      return (await signedInToken(request, env, url.origin))
+      return (await readSession(env, cookieValue(request, SESSION_COOKIE)))
         ? Response.redirect(`${url.origin}/`, 302)
         : Response.redirect(await startSignIn(env, url.origin, {}), 302);
     }
 
-    // Password mode: the form, then the check.
-    if (path === '/login/password' && !usesLoginService(env)) {
+    if (path === '/login' || path === '/signup') {
+      if (serverMode(env) === 'unset') return plain('Not set up', NOT_SET_UP, 503);
       if (!(await peekPending(env, p))) return plain('Sign-in expired', 'Start again from the setup page.', 400);
-      if (request.method !== 'POST') return html(loginPage(url.pathname + url.search));
-      const token = await tokenFromPassword(env, String((await request.formData()).get('password') ?? ''));
-      if (!token) return html(loginPage(url.pathname + url.search, 'Wrong password.'), 401);
-      return proceed(env, p, token);
-    }
-
-    // Login service mode: back from the service with a one-time code.
-    if (path === '/login/return' && usesLoginService(env)) {
-      const code = url.searchParams.get('finereli_code');
-      if (!code) return plain('Sign-in cancelled', 'Nothing was linked.', 401);
-      const token = await tokenFromLoginCode(env, url.origin, code);
-      if (!token) return plain('Not your server', 'This server belongs to someone else.', 403);
-      return proceed(env, p, token);
+      const here = url.pathname + url.search;
+      const other = `${path === '/login' ? '/signup' : '/login'}?p=${encodeURIComponent(p)}`;
+      if (path === '/signup' && single) return plain('Not available', 'This server is for one person.', 404);
+      const page = (error?: string, email?: string) =>
+        path === '/login' ? loginPage(here, { single, error, email, signupHref: other }) : signupPage(here, { error, email, needsCode: Boolean(env.SIGNUP_CODE), loginHref: other });
+      if (request.method !== 'POST') return html(page());
+      const form = await request.formData();
+      const email = String(form.get('email') ?? '');
+      const password = String(form.get('password') ?? '');
+      const r = path === '/login'
+        ? await signIn(env, { email, password }, zone(request))
+        : await signUp(env, { email, password, code: String(form.get('code') ?? '') }, zone(request));
+      if (!r.ok) return r.full ? html(fullPage(signupLimit, contact), 503) : html(page(r.error, email), r.status);
+      if (r.seats) await milestone(env, r.seats.taken, r.seats.limit);
+      return proceed(env, p, r.who);
     }
 
     if (path.startsWith('/pair/')) {
-      if (!(await isOwnerToken(env, url.origin, bearer(request)))) return json({ error: 'unauthorized' }, 401);
-      if (path === '/pair/status') return json(await wa(env).pairStatus());
+      const who = await readSession(env, bearer(request));
+      if (!who) return json({ error: 'unauthorized' }, 401);
+      const wa = await unlockedStub(env, who);
+      if (path === '/pair/status') return json(await wa.pairStatus());
       if (path === '/pair/start' && request.method === 'POST') {
-        if (!(await wa(env).isPaired())) await wa(env).startPairing();
+        if (!(await wa.isPaired())) await wa.startPairing();
         return json({ ok: true });
       }
       if (path === '/pair/relink' && request.method === 'POST') {
-        await wa(env).logout();
+        await wa.logout();
         return json({ ok: true });
+      }
+      if (path === '/pair/delete' && request.method === 'POST') {
+        await wa.destroy();
+        if (!single) await seatRegistry(env).release(); // the seat goes back to the pool
+        // agents that were connected can't reach a store that no longer exists
+        for (let cursor: string | undefined; ; ) {
+          const page = await env.OAUTH_PROVIDER.listUserGrants(who.userId, { cursor });
+          for (const g of page.items) await env.OAUTH_PROVIDER.revokeGrant(g.id, who.userId);
+          if (!page.cursor) break;
+          cursor = page.cursor;
+        }
+        return json({ ok: true }, 200);
       }
       if (path === '/pair/code' && request.method === 'POST') {
         const { phone } = (await request.json()) as { phone: string };
-        try { return json({ code: await wa(env).requestPairingCode(phone) }); }
+        try { return json({ code: await wa.requestPairingCode(phone) }); }
         catch (e: any) { return json({ error: e?.message ?? 'failed' }, 500); }
       }
       if (path === '/pair/finish' && request.method === 'POST') {
         const { req } = (await request.json()) as { req: string };
-        return json({ redirectTo: await completeOauth(env, unb64(req)) });
+        return json({ redirectTo: await completeOauth(env, unb64(req), who) });
       }
     }
 
-    if (path.startsWith('/debug')) {
+    // What a deployment's operator can see without anyone's key: whether a session is running, and its log.
+    if (path === '/debug') {
       if (!pinOk(request, env)) return new Response('unauthorized', { status: 401 });
-      try { return await debugRoute(path, url, env); } catch (e: any) { return json({ error: String(e?.message ?? e) }, 500); }
+      if (url.searchParams.get('u') === 'seats') return json({ taken: await seatRegistry(env).count(), limit: signupLimit });
+      return json(await accountStub(env, url.searchParams.get('u') ?? 'owner').debug());
     }
 
     return new Response('Not found', { status: 404 });
   },
 };
 
-/** Machine-readable peeks for whoever is debugging a deployment. Guarded by the PIN secret. */
-async function debugRoute(path: string, url: URL, env: Env): Promise<Response> {
-  const q = url.searchParams;
-  if (path === '/debug/pull') return json(await wa(env).pull().catch((e) => ({ error: String(e) })));
-  if (path === '/debug/chats') return json(await wa(env).listChats(q.get('q') ?? undefined, 10));
-  if (path === '/debug/unnamed') return json(await wa(env).unnamedChats(Number(q.get('limit') ?? 10)));
-  if (path === '/debug/sql') return json(await wa(env).select(q.get('q') ?? ''));
-  if (path === '/debug/types') return json(await wa(env).typeCounts());
-  if (path === '/debug/search') return json(await wa(env).search({ query: q.get('q') ?? '', limit: 5 }));
-  if (path === '/debug/messages') {
-    const [c] = await wa(env).resolveChat(q.get('chat') ?? '');
-    return json(c ? { chat: c, rows: await wa(env).getMessages({ chat: c.jid, limit: 8 }) } : { error: 'no chat' });
-  }
-  if (path === '/debug/logout') { await wa(env).logout(); return json({ ok: true }); }
-  return json(await wa(env).debug());
-}
-
 const oauth = new OAuthProvider({
   apiRoute: '/mcp',
-  apiHandler: { fetch: (request: Request, env: Env) => handleMcp(request, env) } as any,
+  apiHandler: { fetch: (request: Request, env: Env, ctx: ExecutionContext & { props: McpProps }) => handleMcp(request, env, ctx.props) } as any,
   defaultHandler: ownerHandler as any,
   authorizeEndpoint: '/authorize',
   tokenEndpoint: '/token',
@@ -180,14 +200,4 @@ const oauth = new OAuthProvider({
 
 export default {
   fetch: (request: Request, env: Env, ctx: ExecutionContext) => oauth.fetch(request, env, ctx),
-
-  /** Daily pull, so WhatsApp's per-device queue never has time to age out. */
-  async scheduled(_event: ScheduledController, env: Env, ctx: ExecutionContext) {
-    ctx.waitUntil(
-      (async () => {
-        const stub = wa(env);
-        if (await stub.isPaired()) console.log('daily pull', await stub.pull());
-      })(),
-    );
-  },
 };
