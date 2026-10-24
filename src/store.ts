@@ -331,16 +331,59 @@ export class Store {
     this.sql.exec(`UPDATE messages SET data = ?${type ? ', type = ?' : ''} WHERE chat = ? AND id = ?`, ...[this.vault.seal(blob, MSG), ...(type ? [type] : []), cid, id]);
   }
 
-  /** Inserts new messages and applies edits/deletes. Returns how many were new. */
+  /**
+   * A reaction is stored as its own line in the chat, at the time it was made, so an agent reading the latest
+   * messages sees it as the reply it often is. One per person per message: a new emoji replaces the old one,
+   * and an empty one (taking it back) removes it.
+   */
+  private react(chat: string, r: { target: string; fromMe: boolean; senderJid: string | null; emoji: string; ts: number; push?: string | null }): number {
+    const cid = this.pj(chat);
+    const sender = r.fromMe ? 'me' : r.senderJid ? this.pj(r.senderJid) : null;
+    const id = `react:${r.target}:${sender ?? '?'}`;
+    const old = this.sql.exec<{ ts: number }>(`SELECT ts FROM messages WHERE chat = ? AND id = ?`, cid, id).toArray()[0];
+    if (old && old.ts > r.ts) return 0; // an older update arriving late
+    if (!r.emoji) {
+      if (old) this.sql.exec(`DELETE FROM messages WHERE chat = ? AND id = ?`, cid, id);
+      return 0;
+    }
+    const t = this.sql.exec<{ data: ArrayBuffer }>(`SELECT data FROM messages WHERE chat = ? AND id = ?`, cid, r.target).toArray()[0];
+    const said = t ? this.vault.open<MsgBlob>(t.data, MSG).b : null;
+    const quote = said ? ` to "${said.length > 80 ? said.slice(0, 80).trimEnd() + '…' : said}"` : ' to a message';
+    const blob: MsgBlob = { b: `[reacted ${r.emoji}${quote}]` };
+    if (r.push) blob.p = r.push;
+    if (!r.fromMe && r.senderJid) blob.s = r.senderJid;
+    this.sql.exec(
+      `INSERT OR REPLACE INTO messages (id, chat, ts, from_me, sender, type, data) VALUES (?,?,?,?,?,?,?)`,
+      id, cid, r.ts, r.fromMe ? 1 : 0, sender, 'reaction', this.vault.seal(blob, MSG),
+    );
+    return old ? 0 : 1;
+  }
+
+  /** Inserts new messages and applies edits/deletes and reactions. Returns how many were new. */
   ingestMessages(msgs: proto.IWebMessageInfo[]): number {
     let added = 0;
     const chatsSeen = new Map<string, { group: 0 | 1; push?: { p: string; ts: number } }>();
+    // reactions wait until the batch's messages are in, so they can quote the message they react to
+    const reactions: { chat: string; r: Parameters<Store['react']>[1] }[] = [];
     this.tx(() => {
       for (const msg of msgs) {
         const key = msg.key;
         if (!key?.id || !key.remoteJid || key.remoteJid === 'status@broadcast') continue;
         const chat = this.norm(key.remoteJid, (key as any).remoteJidAlt);
         if (!chat) continue;
+        const isGroupChat = chat.endsWith('@g.us');
+        const who = (k: proto.IMessageKey | null | undefined, participant?: string | null) =>
+          k?.fromMe ? null : isGroupChat ? this.norm(k?.participant ?? participant, (k as any)?.participantAlt) : chat;
+        // history sync can carry reactions on the message itself
+        for (const x of msg.reactions ?? []) {
+          reactions.push({ chat, r: { target: key.id, fromMe: !!x.key?.fromMe, senderJid: who(x.key), emoji: x.text ?? '', ts: Math.floor(num(x.senderTimestampMs) / 1000) || num(msg.messageTimestamp) } });
+        }
+        const rm = normalizeMessageContent(msg.message)?.reactionMessage;
+        if (rm?.key?.id) {
+          reactions.push({ chat, r: { target: rm.key.id, fromMe: !!key.fromMe, senderJid: who(key, msg.participant), emoji: rm.text ?? '', ts: Math.floor(num(rm.senderTimestampMs) / 1000) || num(msg.messageTimestamp), push: msg.pushName } });
+          if (!chatsSeen.has(chat)) chatsSeen.set(chat, { group: isGroupChat ? 1 : 0 });
+          continue;
+        }
         const proto_ = msg.message?.protocolMessage;
         if (proto_?.key?.id) {
           if (proto_.editedMessage) {
@@ -389,6 +432,7 @@ export class Store {
         if (!key.fromMe && msg.pushName && (seen.push?.ts ?? -1) <= ts) seen.push = { p: msg.pushName, ts };
         chatsSeen.set(chat, seen);
       }
+      for (const { chat, r } of reactions) added += this.react(chat, r);
       // one write per chat for the batch, not one per message
       for (const [jid, seen] of chatsSeen) {
         const old = this.getChat(jid);

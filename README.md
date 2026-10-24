@@ -111,6 +111,8 @@ The first version stored messages in plain text. The first sign-in after you dep
 
 **Media isn't downloaded.** Photos, voice notes and documents appear as labels like `[image]` or `[voice note 12s]`, with the caption if there was one. Nothing is transcribed.
 
+**Reactions show up as replies.** A 🙏 on a message appears in the chat at the time it was sent, as `[reacted 🙏 to "the message"]`, from whoever sent it. Changing a reaction replaces it, and taking it back removes it. Reactions from before this was added were never stored, so they only appear for older messages if you relink and re-import.
+
 **Relinking.** If your phone says the device was removed, or you want to start over, ask your agent to run `relink`, or open `/setup` and choose "Unlink and scan again". You scan a new QR code. Stored messages are kept.
 
 ## Running it for other people

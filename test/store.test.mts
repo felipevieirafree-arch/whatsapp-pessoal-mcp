@@ -136,6 +136,37 @@ check('and its messages follow', (store.getMessages({ chat: LIDPN, limit: 5 }) a
 store.ingestMessages([M('l2', LID, 610, 'later, still on the lid')]);
 check('later lid messages land on the number', (store.getMessages({ chat: LIDPN, limit: 5 }) as any[]).length === 2);
 
+// ---------- reactions ----------
+{
+  const { sql: rsql } = makeSql();
+  initSchema(rsql);
+  const rs = new Store(rsql, (fn) => fn(), vault);
+  const DANA = '972555555555@s.whatsapp.net', GROUP = '9999@g.us';
+  const R = (id: string, chat: string, ts: number, target: string, text: string, fromMe = false, extra: any = {}) =>
+    ({ key: { id, remoteJid: chat, fromMe, ...extra.key }, messageTimestamp: ts, message: { reactionMessage: { key: { id: target }, text, senderTimestampMs: ts * 1000 } }, pushName: extra.pushName }) as any;
+  const body = (chat: string) => (rs.getMessages({ chat, limit: 20 }) as any[]).map((m) => `${m.sender}: ${m.body}`);
+
+  rs.ingestMessages([M('q1', DANA, 100, 'are we still on for 8?', false, { pushName: 'Dana' })]);
+  check('my reaction counts as a new message', rs.ingestMessages([R('x1', DANA, 200, 'q1', '🙏', true)]) === 1);
+  check('a reaction shows as my reply, quoting the message', body(DANA).at(-1) === 'Me: [reacted 🙏 to "are we still on for 8?"]', body(DANA));
+  rs.ingestMessages([R('x2', DANA, 210, 'q1', '❤️', true)]);
+  check('changing it replaces the old one', body(DANA).length === 2 && body(DANA).at(-1)!.includes('❤️'), body(DANA));
+  rs.ingestMessages([R('x0', DANA, 150, 'q1', '👍', true)]);
+  check('an older update arriving late is ignored', body(DANA).at(-1)!.includes('❤️'), body(DANA));
+  rs.ingestMessages([R('x3', DANA, 220, 'q1', '', true)]);
+  check('taking it back removes it', body(DANA).length === 1, body(DANA));
+  rs.ingestMessages([R('x4', DANA, 230, 'q1', '😂', false, { pushName: 'Dana' })]);
+  check('their reaction is theirs', body(DANA).at(-1) === 'Dana: [reacted 😂 to "are we still on for 8?"]', body(DANA));
+
+  // a reaction and its message in the same batch, in the wrong order
+  rs.ingestMessages([R('y1', GROUP, 310, 'g9', '👍', false, { key: { participant: DANA }, pushName: 'Dana' }), M('g9', GROUP, 300, 'pizza tonight', false, { key: { participant: GILAD } })]);
+  check('a group reaction quotes a message from the same batch', body(GROUP).at(-1) === 'Dana: [reacted 👍 to "pizza tonight"]', body(GROUP));
+  // history sync puts reactions on the message itself
+  rs.ingestMessages([{ ...M('g8', GROUP, 320, 'who is in'), key: { id: 'g8', remoteJid: GROUP, fromMe: false, participant: GILAD }, reactions: [{ key: { fromMe: true }, text: '✋', senderTimestampMs: 330000 }] } as any]);
+  check('reactions carried on a history message are kept', body(GROUP).at(-1) === 'Me: [reacted ✋ to "who is in"]', body(GROUP));
+  check('reactions are searchable', (rs.search({ queries: ['pizza'], limit: 10 }).hits[0]).length === 2);
+}
+
 // ---------- search ----------
 
 const ts0 = 1000;
