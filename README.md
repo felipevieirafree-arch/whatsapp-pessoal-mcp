@@ -8,8 +8,12 @@ Built by [@finereli](https://x.com/finereli). Questions and bug reports go in an
 
 There are two ways to use it:
 
-- **Run your own copy** in your Cloudflare account. This is what the setup guide below covers. Free apart from Cloudflare's few dollars a month.
-- **Use a hosted copy**, if someone runs one for you. You sign in with Google, link your phone, and skip to "Connect your agent". See "Running it for other people" if you want to be that someone.
+- **Use it at [whatsapp.finereli.com](https://whatsapp.finereli.com).** This is the quick way. Sign in with Google, scan the QR code with your phone, and add `https://whatsapp.finereli.com/mcp` to your agent. It's a free beta with a limited number of seats and a size limit per account. Your messages are encrypted at rest, but I run the login service, so in principle I could derive your key. "What it guarantees" below says exactly what that means. If you'd rather not trust me, run your own copy.
+- **Run your own copy** in your Cloudflare account. This is what the setup guide below covers. Free apart from Cloudflare's few dollars a month, and the key comes from a password only you know. Anyone can also run it as a service for other people: see "Running it for other people".
+
+The easiest way to set up the hosted version is to let your agent do it. Paste this into Claude, ChatGPT or Grok:
+
+> Set up WhatsApp for me via https://whatsapp.finereli.com. Read https://whatsapp.finereli.com/llms.txt and walk me through it.
 
 Ask your agent things like:
 
@@ -51,7 +55,7 @@ Your messages live in a SQLite database inside a Durable Object in Cloudflare, o
 
 **The people in your chats didn't agree to this.** Their messages to you are in the copy too. It's your call whether you're comfortable with that.
 
-## Set it up
+## Run your own copy
 
 You need a Cloudflare account on the Workers Paid plan (see the note below), Node 20 or later, and your phone.
 
