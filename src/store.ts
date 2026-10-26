@@ -563,6 +563,35 @@ export class Store {
       .map(({ jid, name, is_group, messages, last_ts }) => ({ jid, name, is_group, messages, last_ts }));
   }
 
+  recentMessages(opts: { since?: number; limit: number }) {
+    const where: string[] = [];
+    const args: number[] = [];
+    if (opts.since) { where.push(`ts >= ?`); args.push(opts.since); }
+    const s = this.snapshot();
+    const jidOf = new Map<string, string>();
+    for (const [cid, rec] of s.chats) jidOf.set(cid, rec.jid);
+    return this.sql
+      .exec<{ id: string; chat: string; ts: number; from_me: number; sender: string | null; type: string; data: ArrayBuffer }>(
+        `SELECT id, chat, ts, from_me, sender, type, data FROM messages ${where.length ? `WHERE ${where.join(' AND ')}` : ''} ORDER BY ts DESC LIMIT ?`,
+        ...args, opts.limit,
+      )
+      .toArray()
+      .map((r) => {
+        const blob = this.vault.open<MsgBlob>(r.data, MSG);
+        const jid = jidOf.get(r.chat) ?? r.chat;
+        return {
+          id: r.id,
+          chat: jid,
+          chat_name: this.nameOf(jid, s).name,
+          ts: r.ts,
+          from_me: Boolean(r.from_me),
+          sender: this.senderLabel(r, blob, s),
+          type: r.type,
+          body: blob.b,
+        };
+      });
+  }
+
   getMessages(opts: { chat: string; before?: number; after?: number; limit: number; newestFirst?: boolean }) {
     const where = [`chat = ?`];
     const args: (string | number)[] = [this.pj(opts.chat)];
