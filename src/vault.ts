@@ -13,7 +13,7 @@
  * What this does not protect against: an operator who deploys modified code can capture passwords as they are
  * typed, and the server handles plaintext while it answers a request. It is encryption at rest, not end-to-end.
  */
-import { createCipheriv, createDecipheriv, createHash, createHmac, randomBytes, timingSafeEqual } from 'node:crypto';
+import { createCipheriv, createDecipheriv, createHash, createHmac, pbkdf2, randomBytes, timingSafeEqual } from 'node:crypto';
 
 const FORMAT = 1;
 const NONCE = 12;
@@ -56,8 +56,14 @@ export interface AccountRecord {
 }
 
 async function stretch(password: string, salt: Buffer, iterations: number) {
-  const base = await crypto.subtle.importKey('raw', new TextEncoder().encode(password.normalize('NFKC')), 'PBKDF2', false, ['deriveBits']);
-  const master = Buffer.from(await crypto.subtle.deriveBits({ name: 'PBKDF2', hash: 'SHA-256', salt, iterations }, base, 256));
+  // Cloudflare Web Crypto caps PBKDF2 at 100,000 iterations. The Node-compatible
+  // implementation supports the full count, so keep the original 600,000-round hardening.
+  const master = await new Promise<Buffer>((resolve, reject) => {
+    pbkdf2(password.normalize('NFKC'), salt, iterations, 32, 'sha256', (error, derived) => {
+      if (error) reject(error);
+      else resolve(derived);
+    });
+  });
   // Two independent keys from one stretch: one wraps the DEK, one proves the password.
   return { kek: hmac(master, 'kek'), auth: hmac(master, 'auth') };
 }
