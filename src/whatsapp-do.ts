@@ -60,6 +60,8 @@ export class WhatsAppStore extends DurableObject<Env> {
     return this.unlocked;
   }
   private session: Promise<SessionResult> | null = null;
+  private sendTail: Promise<void> = Promise.resolve();
+  private sendPending = 0;
   private phase: Phase = 'idle';
   private qr: string | null = null;
   private pairingCode: string | null = null;
@@ -264,6 +266,7 @@ export class WhatsAppStore extends DurableObject<Env> {
   /** Pull anything new from WhatsApp. Safe to call concurrently; callers share one session. */
   async pull(): Promise<SessionResult> {
     if (!this.auth.isPaired()) throw new Error('not paired');
+    if (this.sendPending) await this.sendTail;
     if (this.meta('full') === '1') {
       // an account that was full may have room now, if the operator raised the limit or messages were removed
       if (verdict(this.size(), limitsOf(this.env), false)) {
@@ -298,10 +301,71 @@ export class WhatsAppStore extends DurableObject<Env> {
   listChats(query: string | undefined, limit: number) { return this.store.listChats(query, limit); }
   resolveChat(ref: string) { return this.store.resolveChat(ref); }
   getMessages(o: Parameters<Store['getMessages']>[0]) { return this.store.getMessages(o); }
+  recentMessages(o: Parameters<Store['recentMessages']>[0]) { return this.store.recentMessages(o); }
   search(o: Parameters<Store['search']>[0]) { return this.store.search(o); }
   counts() { return this.store.counts(); }
   unnamedChats(limit: number) { return this.store.unnamedChats(limit); }
   setNames(rows: { jid: string; name: string }[]) { return this.store.setCustomNames(rows); }
+
+  /**
+   * Send one plain-text message. Calls are serialized so two MCP requests never open competing
+   * WhatsApp sockets. The MCP layer only exposes this after an explicit user confirmation.
+   */
+  sendText(jid: string, body: string) {
+    this.sendPending++;
+    const run = this.sendTail.then(() => this.sendTextNow(jid, body));
+    this.sendTail = run.then(
+      () => { this.sendPending--; },
+      () => { this.sendPending--; },
+    );
+    return run;
+  }
+
+  private async sendTextNow(jid: string, body: string) {
+    if (!this.auth.isPaired()) throw new Error('WhatsApp is not linked');
+    if (!/@(?:s\.whatsapp\.net|g\.us)$/.test(jid)) throw new Error('recipient must be an existing WhatsApp chat');
+    const message = body.trim();
+    if (!message) throw new Error('message is empty');
+    if (message.length > 4096) throw new Error('message is longer than 4096 characters');
+    if (this.session) await this.session;
+
+    const intervalsBefore = new Set(liveIntervals);
+    const sock = makeWASocket({
+      auth: this.auth.state,
+      logger: silent((lvl, a) => this.note(`send ${lvl}: ${a.map(show).join(' ').slice(0, 300)}`)),
+      markOnlineOnConnect: false,
+      generateHighQualityLinkPreview: false,
+      getMessage: async () => undefined,
+    });
+    sock.ev.on('creds.update', () => { void this.auth.saveCreds(); });
+
+    try {
+      await new Promise<void>((resolve, reject) => {
+        const t = setTimeout(() => reject(new Error('timed out connecting to WhatsApp')), 20_000);
+        sock.ev.on('connection.update', (u) => {
+          if (u.connection === 'open') { clearTimeout(t); resolve(); }
+          if (u.connection === 'close') {
+            clearTimeout(t);
+            const code = (u.lastDisconnect?.error as any)?.output?.statusCode;
+            reject(new Error(`WhatsApp connection closed before sending${code ? ` (code ${code})` : ''}`));
+          }
+        });
+      });
+      const sent = await sock.sendMessage(jid, { text: message });
+      if (!sent) throw new Error('WhatsApp did not return a sent message');
+      this.store.ingestMessages([sent]);
+      this.store.setMeta('last_pull', String(Date.now()));
+      return {
+        id: sent.key.id ?? '',
+        chat: jid,
+        chat_name: this.store.chatName(jid),
+        ts: Number(sent.messageTimestamp) || Math.floor(Date.now() / 1000),
+      };
+    } finally {
+      try { sock.end(undefined); } catch {}
+      for (const id of [...liveIntervals]) if (!intervalsBefore.has(id)) clearInterval(id);
+    }
+  }
 
   // ---------- the session ----------
 
