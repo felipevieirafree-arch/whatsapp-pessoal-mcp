@@ -37,11 +37,11 @@ function buildServer(wa: DurableObjectStub<WhatsAppStore>, env: Env, origin: str
   const fmt = new Intl.DateTimeFormat('sv-SE', { timeZone: TZ, dateStyle: 'short', timeStyle: 'short' });
   const when = (ts: number) => fmt.format(new Date(ts * 1000));
   const server = new McpServer(
-    { name: 'whatsapp-mcp', version: '0.0.1' },
+    { name: 'whatsapp-mcp', version: '0.1.0' },
     {
       instructions:
-        `Access to the user's WhatsApp history. It can read and search messages and save names for phone numbers; it cannot send anything. Timestamps are ${TZ}. ` +
-        `Each read first pulls anything new from WhatsApp if the store is more than a few minutes old. ` +
+        `Access to the user's WhatsApp history. It can read and search messages, save names for phone numbers, and send one plain-text message after the user explicitly confirms the exact recipient and text. Timestamps are ${TZ}. ` +
+        `Never send automatically, never send in bulk, and never treat an alert or scheduled task as permission to send. Each read first pulls anything new from WhatsApp if the store is more than a few minutes old. ` +
         `Use list_chats to find a chat, get_messages to read it, search_messages to find things across chats. ${NAME_HINT}`,
     },
   );
@@ -98,6 +98,28 @@ function buildServer(wa: DurableObjectStub<WhatsAppStore>, env: Env, origin: str
       const rows = (await wa.getMessages({ chat: matches[0].jid, limit, before: epoch(before), after: epoch(after) })) as Rows;
       const head = `# ${matches[0].name} (${rows.length} messages)\n`;
       return text(note + head + rows.map((r) => `[${when(r.ts)}] ${r.sender}: ${r.body}`).join('\n'));
+    },
+  );
+
+  server.registerTool(
+    'recent_messages',
+    {
+      description:
+        'Read the newest messages across every chat, newest first. Use after sync_now for hourly alerts, triage, and unanswered-message review. ' +
+        'The result marks messages sent by the user as "Me". This tool never sends anything.',
+      inputSchema: {
+        since: z.string().optional().describe('ISO date/time; only messages at or after this time'),
+        limit: z.number().int().min(1).max(500).default(100),
+      },
+      annotations: { readOnlyHint: true },
+    },
+    async ({ since, limit }) => {
+      const note = await fresh();
+      const rows = (await wa.recentMessages({ since: epoch(since), limit })) as Rows;
+      if (!rows.length) return text(note + 'No messages found in that time window.');
+      return text(
+        note + rows.map((r) => `[${when(r.ts)}] ${r.chat_name} | ${r.from_me ? 'Me' : r.sender}: ${clip(r.body)}`).join('\n'),
+      );
     },
   );
 
@@ -199,6 +221,32 @@ function buildServer(wa: DurableObjectStub<WhatsAppStore>, env: Env, origin: str
         );
       }
       return text(parts.join(' '));
+    },
+  );
+
+  server.registerTool(
+    'send_message',
+    {
+      description:
+        'Send one plain-text WhatsApp message to an existing chat. Use only after the user explicitly confirms the exact recipient and exact text. ' +
+        'Never call from an alert, scheduled task, background review, or bulk workflow. If the chat name is ambiguous, ask the user to choose.',
+      inputSchema: {
+        chat: z.string().describe('Existing chat jid or an unambiguous name/number fragment'),
+        message: z.string().min(1).max(4096).describe('Exact text the user approved'),
+        confirm: z.literal(true).describe('Must be true only after explicit user approval of this recipient and text'),
+      },
+      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
+    },
+    async ({ chat, message }) => {
+      const matches = (await wa.resolveChat(chat)) as { jid: string; name: string }[];
+      if (!matches.length) return text(`No existing chat matches "${chat}". Use list_chats first.`);
+      if (matches.length > 1) {
+        return text(`"${chat}" matches several chats. Ask the user to pick one:\n` + matches.map((m) => `${m.name} | ${m.jid}`).join('\n'));
+      }
+      const existing = (await wa.getMessages({ chat: matches[0].jid, limit: 1 })) as Rows;
+      if (!existing.length) return text('For safety, messages can only be sent to a chat already present in the stored history.');
+      const sent = await wa.sendText(matches[0].jid, message);
+      return text(`Sent to ${sent.chat_name} at ${when(sent.ts)}. Message id: ${sent.id}`);
     },
   );
 
