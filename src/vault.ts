@@ -18,7 +18,8 @@ import { createCipheriv, createDecipheriv, createHash, createHmac, pbkdf2, rando
 const FORMAT = 1;
 const NONCE = 12;
 const TAG = 16;
-export const KDF_ITERATIONS = 600_000;
+// Cloudflare caps PBKDF2 at 100,000 iterations. Use a unique high-entropy password.
+export const KDF_ITERATIONS = 100_000;
 /** A key handed over by the login service already has 256 bits of entropy, so there is nothing to stretch. */
 export const KEY_STRETCH = 1;
 
