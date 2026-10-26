@@ -140,7 +140,10 @@ export class WhatsAppStore extends DurableObject<Env> {
     } else {
       this.setMeta('canary', b64(vault.seal('ok', 'canary')));
     }
-    const auth = sqliteAuthState(sql, vault, (paired) => this.setMeta('paired', paired ? '1' : '0'));
+    const auth = sqliteAuthState(sql, vault, (paired) => {
+      const value = paired ? '1' : '0';
+      if (this.meta('paired') !== value) this.setMeta('paired', value);
+    });
     this.unlocked = { dek, vault, auth, store: new Store(sql, tx, vault) };
   }
 
