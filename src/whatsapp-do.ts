@@ -72,7 +72,13 @@ export class WhatsAppStore extends DurableObject<Env> {
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
-    initSchema(ctx.storage.sql);
+    // Avoid issuing schema-write statements on every cold start. Once the free tier's
+    // daily row-write allowance is exhausted, even harmless initialization can block
+    // otherwise read-only MCP calls. Existing objects already have the schema.
+    const ready = ctx.storage.sql
+      .exec<{ n: number }>(`SELECT COUNT(*) AS n FROM sqlite_master WHERE type = 'table' AND name = 'meta'`)
+      .toArray()[0]?.n;
+    if (!ready) initSchema(ctx.storage.sql);
   }
 
   // ---------- accounts and keys (no key needed) ----------
