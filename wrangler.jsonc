@@ -1,6 +1,6 @@
 {
   "$schema": "node_modules/wrangler/config-schema.json",
-  "name": "whatsapp-mcp",
+  "name": "whatsapp-pessoal-mcp",
   "main": "src/index.ts",
   "compatibility_date": "2025-09-01",
   "compatibility_flags": ["nodejs_compat"],
@@ -26,8 +26,8 @@
   //   npx wrangler kv namespace create OAUTH_KV
   "kv_namespaces": [{ "binding": "OAUTH_KV", "id": "REPLACE_WITH_KV_NAMESPACE_ID" }],
 
-  // First history import decodes a lot of protobuf; the default CPU budget is too small. Needs Workers Paid.
-  "limits": { "cpu_ms": 300000 },
+  // Free-plan settings for this personal deployment.
+  "vars": { "TIMEZONE": "America/Sao_Paulo", "DEFAULT_COUNTRY_CODE": "55" },
 
   // There is no daily pull: messages are encrypted with a key that exists only while someone is signed in,
   // so syncing happens when an agent asks (see "Things to know" in the README).
