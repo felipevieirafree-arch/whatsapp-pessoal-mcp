@@ -9,6 +9,8 @@ import { toJid } from './phone.js';
 import { shouldSkipManualSync, autoSyncEnabled } from './usage-policy.js';
 
 const STALE_MS = 10 * 60_000;
+const DEFAULT_RECENT_HOURS = 72;
+const recentSince = (hours = DEFAULT_RECENT_HOURS) => Math.floor(Date.now() / 1000) - hours * 3600;
 
 const epoch = (s?: string) => {
   if (!s) return undefined;
@@ -66,11 +68,11 @@ function buildServer(wa: DurableObjectStub<WhatsAppStore>, env: Env, origin: str
       description:
         'List chats (DMs and groups), most recently active first. Optionally filter by name or number fragment. ' +
         "If a person you're looking for isn't here by name, they may be a chat known only by number: see unnamed_chats.",
-      inputSchema: { query: z.string().optional(), limit: z.number().int().min(1).max(100).default(30) },
+      inputSchema: { query: z.string().optional(), limit: z.number().int().min(1).max(100).default(30), hours: z.number().int().min(1).max(168).default(72).describe('Recent window in hours, default 72, max 168. Old chats can be found by exact name using get_messages.') },
     },
-    async ({ query, limit }) => {
+    async ({ query, limit, hours }) => {
       const note = await fresh();
-      const rows = (await wa.listChats(query, limit)) as Rows;
+      const rows = (await wa.listRecentChats(query, limit, recentSince(hours))) as Rows;
       if (!rows.length) return text(note + `No chats found${query ? ` matching "${query}"` : ''}. ${query ? NAME_HINT : ''}`.trimEnd());
       return text(
         note + rows.map((r) => `${r.name}${r.is_group ? ' [group]' : ''} | ${r.messages} msgs | last ${when(r.last_ts)} | ${r.jid}`).join('\n'),
