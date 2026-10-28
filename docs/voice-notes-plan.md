@@ -43,3 +43,8 @@ The upstream repository is public and holds deployment templates; review `wrangl
 - The existing production Worker has **not** been modified, and these mitigations will have no effect until reviewed, tested and deployed.
 - Before any deployment: run `npm run typecheck` and `npm test` locally, check Cloudflare account free-plan and billing controls in the dashboard, ensure no usage-based charges can apply, and measure CPU in an isolated local runtime.
 - No audio-transcription model is enabled by this change. Audio transcription may require compute credits and an external processor; do not activate without a verified no-billing path.
+
+## Follow-up: offline-tested 60-minute manual-sync guard
+- A pure helper in `src/usage-policy.ts` skips a manual sync when the last successful pull is less than 60 minutes old; `sync_now` invokes it before opening a WhatsApp socket.
+- An isolated copy of the helper passed its assertions with local Node 22 and `tsc --noEmit --strict` (only this dependency-free helper was typechecked). The complete repo could not be cloned in the sandbox (DNS unavailable), so full MCP typechecks and integration tests are **not** yet approved.
+- `test/usage-policy.test.mjs` is committed for reproducibility. The 60-minute cooldown is a resource guard, not a Cloudflare spend ceiling. An unlimited number of distinct calls over time could still use free-tier allowances. It is not yet deployed.
