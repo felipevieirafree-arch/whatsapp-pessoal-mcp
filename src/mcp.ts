@@ -41,7 +41,7 @@ function buildServer(wa: DurableObjectStub<WhatsAppStore>, env: Env, origin: str
     {
       instructions:
         `Access to the user's WhatsApp history. It can read and search messages, save names for phone numbers, and send one plain-text message after the user explicitly confirms the exact recipient and text. Timestamps are ${TZ}. ` +
-        `Never send automatically, never send in bulk, and never treat an alert or scheduled task as permission to send. Each read first pulls anything new from WhatsApp if the store is more than a few minutes old. ` +
+        `Never send automatically, never send in bulk, and never treat an alert or scheduled task as permission to send. Reads use the encrypted local history by default. To refresh, use sync_now explicitly. ` +
         `Use list_chats to find a chat, get_messages to read it, search_messages to find things across chats. ${NAME_HINT}`,
     },
   );
@@ -50,6 +50,9 @@ function buildServer(wa: DurableObjectStub<WhatsAppStore>, env: Env, origin: str
   const fresh = async (): Promise<string> => {
     try {
       if (!(await wa.isPaired())) return `WhatsApp is not linked yet. Open ${origin}/setup to scan the QR code.\n\n`;
+      // Default: read the already encrypted local history without opening a WhatsApp socket.
+      // Operators may opt into automatic refresh explicitly after reviewing free-tier usage.
+      if (env.AUTO_SYNC_ON_READ !== 'true') return '';
       await wa.pullIfStale(STALE_MS);
       return '';
     } catch (e: any) {
@@ -176,11 +179,12 @@ function buildServer(wa: DurableObjectStub<WhatsAppStore>, env: Env, origin: str
         if (!m.length) return text(note + `No chat matches "${chat}". ${NAME_HINT}`);
         chatJid = m[0].jid;
       }
-      const { hits } = await wa.search({ queries: qs, chat: chatJid, since: epoch(since), until: epoch(until), limit });
+      const { hits, truncated } = await wa.search({ queries: qs, chat: chatJid, since: epoch(since), until: epoch(until), limit });
+      const partial = truncated ? '[Partial search: capped at 2,000 newest matching-window messages to protect free-tier CPU. Narrow by chat/date.]\n' : '';
       const lines = (rows: typeof hits[number]) => rows.map((r) => `[${when(r.ts)}] ${r.chat_name} | ${r.sender}: ${clip(r.body)}`).join('\n');
       const none = `No matches. If you were looking for something a particular person said, they may be saved only as a number. ${NAME_HINT}`;
-      if (qs.length === 1) return text(note + (hits[0].length ? lines(hits[0]) : none));
-      return text(note + qs.map((q, i) => `## ${q} (${hits[i].length} match${hits[i].length === 1 ? '' : 'es'})\n${hits[i].length ? lines(hits[i]) : 'No matches.'}`).join('\n\n'));
+      if (qs.length === 1) return text(note + partial + (hits[0].length ? lines(hits[0]) : none));
+      return text(note + partial + qs.map((q, i) => `## ${q} (${hits[i].length} match${hits[i].length === 1 ? '' : 'es'})\n${hits[i].length ? lines(hits[i]) : 'No matches.'}`).join('\n\n'));
     },
   );
 
