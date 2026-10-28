@@ -1,0 +1,17 @@
+import assert from 'node:assert/strict';
+import { autoSyncEnabled, shouldSkipManualSync, MIN_MANUAL_SYNC_GAP_MS } from '../src/usage-policy.ts';
+const now = Date.parse('2026-10-28T12:00:00Z');
+assert.equal(MIN_MANUAL_SYNC_GAP_MS, 3_600_000);
+assert.equal(autoSyncEnabled(undefined), false);
+assert.equal(autoSyncEnabled('false'), false);
+assert.equal(autoSyncEnabled('TRUE'), false);
+assert.equal(autoSyncEnabled('true'), true);
+assert.equal(shouldSkipManualSync(0, now), false);
+assert.equal(shouldSkipManualSync(now, now), true);
+assert.equal(shouldSkipManualSync(now - 1000, now), true);
+assert.equal(shouldSkipManualSync(now - 3_599_999, now), true);
+assert.equal(shouldSkipManualSync(now - 3_600_000, now), false);
+assert.equal(shouldSkipManualSync(now - 3_600_001, now), false);
+assert.equal(shouldSkipManualSync(now + 1000, now), false);
+assert.equal(shouldSkipManualSync(NaN, now), false);
+console.log('Zero-cost sync policy checks passed');
