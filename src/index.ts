@@ -37,6 +37,8 @@ export interface Env extends AuthEnv {
   OPERATOR_NAME?: string;
   /** Country code (digits, no +) for phone numbers given without one, e.g. "972". */
   DEFAULT_COUNTRY_CODE?: string;
+  /** Opt-in only: auto-sync on read consumes Durable Object CPU and WhatsApp connection time. */
+  AUTO_SYNC_ON_READ?: string;
 }
 
 /** What an agent's token carries: who, and the key that opens their data. Encrypted by the OAuth library under the token. */
