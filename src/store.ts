@@ -14,7 +14,19 @@ import type { Vault } from './vault.js';
 // What each kind of blob is bound to, so one can't be swapped for another.
 const MSG = 'm', CHAT = 'c', CONTACT = 'k', NAME = 'n', ALIAS = 'l';
 
-interface MsgBlob { b: string; p?: string; s?: string }                         // body, push name, sender jid
+/** Only the encrypted media descriptor is retained. The audio bytes are never persisted. */
+export interface VoiceNoteRef {
+  url?: string;
+  directPath?: string;
+  mediaKey: string; // base64, sealed inside MsgBlob (never plaintext SQLite)
+  mimetype?: string;
+  seconds?: number;
+  fileSha256?: string;
+  fileEncSha256?: string;
+  fileLength?: string;
+  ptt: boolean;
+}
+interface MsgBlob { b: string; p?: string; s?: string; voice?: VoiceNoteRef }                         // body, push name, sender jid
 interface ChatRec { jid: string; name?: string | null; group: 0 | 1; push?: string; pushTs?: number }
 interface ContactRec { jid: string; name?: string | null; notify?: string | null }
 
@@ -277,6 +289,16 @@ export class Store {
     return real(ct?.name) ?? (row.sender ? s.customs.get(row.sender) : undefined) ?? real(ct?.notify) ?? blob.p ?? fallback;
   }
 
+  /** Only expose a voice descriptor to the authenticated Durable Object, not to general chat tools. */
+  getVoiceNote(chat: string, id: string): VoiceNoteRef | null {
+    const row = this.sql.exec<{ type: string; data: ArrayBuffer }>(
+      `SELECT type, data FROM messages WHERE chat = ? AND id = ?`, this.pj(chat), id,
+    ).toArray()[0];
+    if (!row || row.type !== 'audio') return null;
+    const blob = this.vault.open<MsgBlob>(row.data, MSG);
+    return blob.voice ?? null;
+  }
+
   // ----- writing -----
 
   private norm(jid?: string | null, alt?: string | null): string | null {
@@ -328,6 +350,7 @@ export class Store {
     if (!r) return;
     const blob = this.vault.open<MsgBlob>(r.data, MSG);
     blob.b = body;
+    if (type === 'deleted') delete blob.voice;
     this.sql.exec(`UPDATE messages SET data = ?${type ? ', type = ?' : ''} WHERE chat = ? AND id = ?`, ...[this.vault.seal(blob, MSG), ...(type ? [type] : []), cid, id]);
   }
 
@@ -396,6 +419,22 @@ export class Store {
         }
         const d = describe(msg);
         if (!d) continue;
+        // Preserve recoverable WhatsApp media metadata within the *already encrypted* message blob.
+        // Existing message rows that were imported before this feature may be backfilled by history sync.
+        const audio = normalizeMessageContent(msg.message)?.audioMessage;
+        const voice: VoiceNoteRef | undefined = d.type === 'audio' && audio?.mediaKey?.length
+          ? {
+              ...(audio.url ? { url: audio.url } : {}),
+              ...(audio.directPath ? { directPath: audio.directPath } : {}),
+              mediaKey: Buffer.from(audio.mediaKey).toString('base64'),
+              ...(audio.mimetype ? { mimetype: audio.mimetype } : {}),
+              ...(audio.seconds != null ? { seconds: num(audio.seconds) } : {}),
+              ...(audio.fileSha256?.length ? { fileSha256: Buffer.from(audio.fileSha256).toString('base64') } : {}),
+              ...(audio.fileEncSha256?.length ? { fileEncSha256: Buffer.from(audio.fileEncSha256).toString('base64') } : {}),
+              ...(audio.fileLength != null ? { fileLength: String(audio.fileLength) } : {}),
+              ptt: Boolean(audio.ptt),
+            }
+          : undefined;
         const isGroup = chat.endsWith('@g.us');
         const senderJid = key.fromMe
           ? 'me'
@@ -408,7 +447,7 @@ export class Store {
 
         const existing = this.sql.exec<{ sender: string | null; data: ArrayBuffer }>(`SELECT sender, data FROM messages WHERE chat = ? AND id = ?`, cid, key.id).toArray()[0];
         if (!existing) {
-          const blob: MsgBlob = { b: d.body };
+          const blob: MsgBlob = { b: d.body, ...(voice ? { voice } : {}) };
           if (msg.pushName) blob.p = msg.pushName;
           if (senderJid && senderJid !== 'me') blob.s = senderJid;
           this.sql.exec(
@@ -416,14 +455,16 @@ export class Store {
             key.id, cid, ts, key.fromMe ? 1 : 0, sender, d.type, this.vault.seal(blob, MSG),
           );
           added++;
-        } else if (existing.sender == null || msg.pushName) {
-          // a repeat delivery can still fill in who sent it, or their push name
+        } else if (existing.sender == null || msg.pushName || voice) {
+          // A repeat delivery may fill missing names or backfill previously discarded media metadata.
           const blob = this.vault.open<MsgBlob>(existing.data, MSG);
           const fillPush = !blob.p && msg.pushName;
           const fillSender = existing.sender == null && sender;
-          if (fillPush || fillSender) {
+          const fillVoice = Boolean(voice && !blob.voice && d.type === 'audio');
+          if (fillPush || fillSender || fillVoice) {
             if (fillPush) blob.p = msg.pushName!;
             if (fillSender && senderJid && senderJid !== 'me') blob.s = senderJid;
+            if (fillVoice) blob.voice = voice;
             this.sql.exec(`UPDATE messages SET sender = COALESCE(sender, ?), data = ? WHERE chat = ? AND id = ?`, sender, this.vault.seal(blob, MSG), cid, key.id);
           }
         }
