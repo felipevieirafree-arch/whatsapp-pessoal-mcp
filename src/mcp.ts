@@ -342,6 +342,7 @@ function buildServer(wa: DurableObjectStub<WhatsAppStore>, env: Env, origin: str
       inputSchema: {},
     },
     async () => {
+      if (env.ENABLE_MANUAL_SYNC !== 'true') return text('Manual synchronization is disabled to protect Cloudflare free-tier resources. Stored messages remain readable.');
       if (!(await wa.isPaired())) return text(`WhatsApp is not linked yet. Open ${origin}/setup to scan the QR code.`);
       const last = await wa.lastPull();
       if (shouldSkipManualSync(last, Date.now())) return text('Manual sync skipped: last pull was less than 60 minutes ago. Existing messages remain available.');
