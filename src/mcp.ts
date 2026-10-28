@@ -50,10 +50,9 @@ function buildServer(wa: DurableObjectStub<WhatsAppStore>, env: Env, origin: str
   /** Top up from WhatsApp; never let a failed pull block reading what we already have. */
   const fresh = async (): Promise<string> => {
     try {
-      if (!(await wa.isPaired())) return `WhatsApp is not linked yet. Open ${origin}/setup to scan the QR code.\n\n`;
-      // Default: read the already encrypted local history without opening a WhatsApp socket.
-      // Operators may opt into automatic refresh explicitly after reviewing free-tier usage.
+      // Preserve free-tier resources: no live status/pull call at all during a normal read.
       if (!autoSyncEnabled(env.AUTO_SYNC_ON_READ)) return '';
+      if (!(await wa.isPaired())) return `WhatsApp is not linked yet. Open ${origin}/setup to scan the QR code.\n\n`;
       await wa.pullIfStale(STALE_MS);
       return '';
     } catch (e: any) {
