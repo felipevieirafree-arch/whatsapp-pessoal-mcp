@@ -234,6 +234,14 @@ check('query parsing', JSON.stringify(parseQuery('a "b c" d*')) === JSON.stringi
   check('deleted voice note loses recoverable metadata', mediaStore.getVoiceNote(jid, 'v1') === null);
 }
 
+// ---------- pairing totals are cached, not re-scanned per poll ----------
+{
+  const first = store.statusCounts();
+  const second = store.statusCounts();
+  check('pairing totals cached within interval', first === second);
+  check('pairing totals match stored messages', first.messages === store.counts().messages);
+}
+
 // ---------- bounded search protects free-tier CPU ----------
 {
   const limited = store.search({ queries: ['phrase-not-in-store-xyz'], limit: 10 });
