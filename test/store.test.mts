@@ -199,6 +199,39 @@ check('it stops as soon as every query is full', early.scanned < total && early.
 check('a query of only punctuation matches nothing', store.search({ queries: ['!!!'], limit: 5 }).hits[0].length === 0);
 check('query parsing', JSON.stringify(parseQuery('a "b c" d*')) === JSON.stringify([{ tokens: ['a'], prefix: false }, { tokens: ['b', 'c'], prefix: false }, { tokens: ['d'], prefix: true }]));
 
+// ---------- voice metadata is encrypted, backfillable and deletable ----------
+{
+  const mediaDb = makeSql();
+  initSchema(mediaDb.sql);
+  const mediaStore = new Store(mediaDb.sql, (fn) => fn(), vault);
+  const jid = '972533333333@s.whatsapp.net';
+  const mediaKey = Buffer.from('secret-media-key-test').toString('base64');
+  const voiceMsg = {
+    key: { id: 'v1', remoteJid: jid, fromMe: false },
+    messageTimestamp: 2000,
+    message: { audioMessage: {
+      ptt: true, seconds: 94, mimetype: 'audio/ogg; codecs=opus',
+      mediaKey: Buffer.from('secret-media-key-test'),
+      directPath: '/v/t62.7117-24/test-private-path',
+    } },
+  } as any;
+  mediaStore.ingestMessages([voiceMsg]);
+  const ref = mediaStore.getVoiceNote(jid, 'v1');
+  check('voice media descriptor is preserved inside encrypted message', ref?.mediaKey === mediaKey && ref?.seconds === 94 && ref?.ptt === true);
+  const raw = (mediaDb.db.prepare("SELECT data FROM messages LIMIT 1").get() as any).data as Uint8Array;
+  check('voice mediaKey and path never appear in plaintext at rest', !Buffer.from(raw).toString('utf8').includes('secret-media-key-test') && !Buffer.from(raw).toString('utf8').includes('test-private-path'));
+  check('normal message output never exposes media key', !(JSON.stringify(mediaStore.getMessages({ chat: jid, limit: 5 }))).includes(mediaKey));
+  const legacyMsg = { ...voiceMsg, key: { ...voiceMsg.key, id: 'v2' },
+    message: { audioMessage: { ptt: true, seconds: 25 } } };
+  mediaStore.ingestMessages([legacyMsg]);
+  check('prior audio without media key has no recoverable descriptor', mediaStore.getVoiceNote(jid, 'v2') === null);
+  mediaStore.ingestMessages([{ ...voiceMsg, key: { ...voiceMsg.key, id: 'v2' } }]);
+  check('re-import can backfill voice metadata', mediaStore.getVoiceNote(jid, 'v2')?.mediaKey === mediaKey);
+  mediaStore.ingestMessages([{ key: { id: 'del-v1', remoteJid: jid, fromMe: false },
+    messageTimestamp: 2010, message: { protocolMessage: { key: { id: 'v1' }, type: 0 } } } as any]);
+  check('deleted voice note loses recoverable metadata', mediaStore.getVoiceNote(jid, 'v1') === null);
+}
+
 // ---------- nothing readable at rest ----------
 
 const allBytes = () => {
