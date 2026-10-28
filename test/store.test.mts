@@ -242,6 +242,16 @@ check('query parsing', JSON.stringify(parseQuery('a "b c" d*')) === JSON.stringi
   check('pairing totals match stored messages', first.messages === store.counts().messages);
 }
 
+// ---------- recent-first inbox avoids full-history grouping ----------
+{
+  const recent = store.listRecentChats(undefined, 20, ts0);
+  check('recent inbox uses date filter', recent.some((r) => r.jid === GILAD));
+  check('future-only inbox is empty', store.listRecentChats(undefined, 20, ts0 + 10_000).length === 0);
+  check('recent inbox respects result limit', store.listRecentChats(undefined, 1, 0).length <= 1);
+  check('old contacts remain resolvable without scanning history', store.resolveChat('Gilad')[0]?.jid === GILAD);
+  check('unknown explicit chat cannot bypass known-history matching', store.resolveChat('000000@s.whatsapp.net').length === 0);
+}
+
 // ---------- bounded search protects free-tier CPU ----------
 {
   const limited = store.search({ queries: ['phrase-not-in-store-xyz'], limit: 10 });
