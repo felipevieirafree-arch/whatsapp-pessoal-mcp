@@ -6,6 +6,7 @@ import type { Env, McpProps } from './index.js';
 import type { WhatsAppStore } from './whatsapp-do.js';
 import { unlockedStub } from './auth.js';
 import { toJid } from './phone.js';
+import { shouldSkipManualSync, autoSyncEnabled } from './usage-policy.js';
 
 const STALE_MS = 10 * 60_000;
 
@@ -52,7 +53,7 @@ function buildServer(wa: DurableObjectStub<WhatsAppStore>, env: Env, origin: str
       if (!(await wa.isPaired())) return `WhatsApp is not linked yet. Open ${origin}/setup to scan the QR code.\n\n`;
       // Default: read the already encrypted local history without opening a WhatsApp socket.
       // Operators may opt into automatic refresh explicitly after reviewing free-tier usage.
-      if (env.AUTO_SYNC_ON_READ !== 'true') return '';
+      if (!autoSyncEnabled(env.AUTO_SYNC_ON_READ)) return '';
       await wa.pullIfStale(STALE_MS);
       return '';
     } catch (e: any) {
@@ -323,6 +324,8 @@ function buildServer(wa: DurableObjectStub<WhatsAppStore>, env: Env, origin: str
     },
     async () => {
       if (!(await wa.isPaired())) return text(`WhatsApp is not linked yet. Open ${origin}/setup to scan the QR code.`);
+      const last = await wa.lastPull();
+      if (shouldSkipManualSync(last, Date.now())) return text('Manual sync skipped: last pull was less than 60 minutes ago. Existing messages remain available.');
       const r = await wa.pull();
       const c = await wa.counts();
       return text(`Pulled ${r.added} new messages in ${(r.ms / 1000).toFixed(1)}s (${r.reason}). Store now holds ${c.messages} messages across ${c.chats} chats.`);
