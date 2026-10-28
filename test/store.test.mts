@@ -216,6 +216,8 @@ check('query parsing', JSON.stringify(parseQuery('a "b c" d*')) === JSON.stringi
     } },
   } as any;
   mediaStore.ingestMessages([voiceMsg]);
+  const listing = mediaStore.listVoiceNotes({ chat: jid, since: 1900, until: 2100, limit: 5 });
+  check('audio inventory exposes message id but never media secret', listing.length === 1 && listing[0].id === 'v1' && listing[0].recoverable === true && !JSON.stringify(listing).includes(mediaKey));
   const ref = mediaStore.getVoiceNote(jid, 'v1');
   check('voice media descriptor is preserved inside encrypted message', ref?.mediaKey === mediaKey && ref?.seconds === 94 && ref?.ptt === true);
   const raw = (mediaDb.db.prepare("SELECT data FROM messages LIMIT 1").get() as any).data as Uint8Array;
