@@ -607,14 +607,23 @@ export class Store {
     return this.chatRows().filter((r) => !r.is_group && r.numberOnly).length;
   }
 
-  /** Resolve a chat reference (jid, or name/number fragment) to jids. */
+  /** Find old OR new chats by name without reading/grouping the message history. */
   resolveChat(ref: string): { jid: string; name: string }[] {
-    if (ref.includes('@')) return [{ jid: ref, name: this.chatName(ref) }];
+    const s = this.snapshot();
+    if (ref.includes('@')) {
+      const cid = this.pj(ref);
+      return s.chats.has(cid) ? [{ jid: ref, name: this.nameOf(ref, s).name }] : [];
+    }
     const q = ref.toLowerCase();
-    return this.chatRows()
-      .filter((r) => r.name.toLowerCase().includes(q) || r.jid.toLowerCase().includes(q))
-      .sort((a, b) => b.last_ts - a.last_ts).slice(0, 10)
-      .map((r) => ({ jid: r.jid, name: r.name }));
+    const matches: { jid: string; name: string }[] = [];
+    for (const r of s.chats.values()) {
+      const name = this.nameOf(r.jid, s).name;
+      if (name.toLowerCase().includes(q) || r.jid.toLowerCase().includes(q)) {
+        matches.push({ jid: r.jid, name });
+        if (matches.length >= 10) break;
+      }
+    }
+    return matches;
   }
 
   chatName(jid: string): string {
@@ -627,6 +636,26 @@ export class Store {
       .filter((r) => !q || r.name.toLowerCase().includes(q) || r.jid.toLowerCase().includes(q))
       .sort((a, b) => b.last_ts - a.last_ts).slice(0, limit)
       .map(({ jid, name, is_group, messages, last_ts }) => ({ jid, name, is_group, messages, last_ts }));
+  }
+
+  /** Daily-use inbox: scan only recently dated rows, never the full 55k+ encrypted history. */
+  listRecentChats(query: string | undefined, limit: number, since: number) {
+    const s = this.snapshot();
+    const q = query?.toLowerCase();
+    const rows = this.sql.exec<{ chat: string; n: number; last: number }>(
+      `SELECT chat, COUNT(*) AS n, MAX(ts) AS last FROM messages INDEXED BY messages_ts
+       WHERE ts >= ? GROUP BY chat ORDER BY last DESC LIMIT ?`, since, 1000,
+    ).toArray();
+    const out: { jid: string; name: string; is_group: number; messages: number; last_ts: number }[] = [];
+    for (const r of rows) {
+      const rec = s.chats.get(r.chat);
+      if (!rec) continue;
+      const name = this.nameOf(rec.jid, s).name;
+      if (q && !name.toLowerCase().includes(q) && !rec.jid.toLowerCase().includes(q)) continue;
+      out.push({ jid: rec.jid, name, is_group: rec.group, messages: r.n, last_ts: r.last });
+      if (out.length >= limit) break;
+    }
+    return out;
   }
 
   recentMessages(opts: { since?: number; limit: number }) {
