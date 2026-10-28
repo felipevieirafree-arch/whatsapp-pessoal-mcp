@@ -239,6 +239,7 @@ interface Snapshot { chats: Map<string, ChatRec>; contacts: Map<string, ContactR
 export class Store {
   private snap: Snapshot | null = null;
   private stats: Map<string, { n: number; last: number }> | null = null;
+  private statusCache: { at: number; result: { messages: number; chats: number } } | null = null;
   private aliasMap: Map<string, string> | null = null;
 
   constructor(private sql: SqlStorage, private tx: <T>(fn: () => T) => T, private vault: Vault) {}
@@ -563,6 +564,15 @@ export class Store {
   }
   getMeta(k: string): string | null {
     return this.sql.exec<{ v: string }>(`SELECT v FROM meta WHERE k = ?`, k).toArray()[0]?.v ?? null;
+  }
+
+  /** Cache status totals briefly: one tab used to trigger costly distinct/group SQL every 1.5s. */
+  statusCounts() {
+    const now = Date.now();
+    if (this.statusCache && now - this.statusCache.at < 60_000) return this.statusCache.result;
+    const result = this.counts();
+    this.statusCache = { at: now, result };
+    return result;
   }
 
   counts() {
