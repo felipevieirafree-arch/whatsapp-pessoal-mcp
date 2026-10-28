@@ -290,6 +290,21 @@ export class Store {
   }
 
   /** Only expose a voice descriptor to the authenticated Durable Object, not to general chat tools. */
+  /** List voice notes without exposing private media keys. */
+  listVoiceNotes(opts: { chat: string; since?: number; until?: number; limit: number }) {
+    const where = ['chat = ?', "type = 'audio'"];
+    const args: (string | number)[] = [this.pj(opts.chat)];
+    if (opts.since != null) { where.push('ts >= ?'); args.push(opts.since); }
+    if (opts.until != null) { where.push('ts <= ?'); args.push(opts.until); }
+    return this.sql.exec<{ id: string; ts: number; data: ArrayBuffer }>(
+      `SELECT id, ts, data FROM messages WHERE ${where.join(' AND ')} ORDER BY ts DESC LIMIT ?`,
+      ...args, opts.limit,
+    ).toArray().map((r) => {
+      const m = this.vault.open<MsgBlob>(r.data, MSG);
+      return { id: r.id, ts: r.ts, body: m.b, recoverable: Boolean(m.voice?.mediaKey) };
+    });
+  }
+
   getVoiceNote(chat: string, id: string): VoiceNoteRef | null {
     const row = this.sql.exec<{ type: string; data: ArrayBuffer }>(
       `SELECT type, data FROM messages WHERE chat = ? AND id = ?`, this.pj(chat), id,
