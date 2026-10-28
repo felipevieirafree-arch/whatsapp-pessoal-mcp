@@ -200,7 +200,10 @@ function buildServer(wa: DurableObjectStub<WhatsAppStore>, env: Env, origin: str
         if (!m.length) return text(note + `No chat matches "${chat}". ${NAME_HINT}`);
         chatJid = m[0].jid;
       }
-      const { hits, truncated } = await wa.search({ queries: qs, chat: chatJid, since: epoch(since), until: epoch(until), limit });
+      // Without a date, protect the free tier by searching only the last 72 hours.
+      // Older messages remain available by supplying an explicit 'since' or selecting a chat.
+      const from = since ? epoch(since) : recentSince();
+      const { hits, truncated } = await wa.search({ queries: qs, chat: chatJid, since: from, until: epoch(until), limit });
       const partial = truncated ? '[Partial search: capped at 2,000 newest matching-window messages to protect free-tier CPU. Narrow by chat/date.]\n' : '';
       const lines = (rows: typeof hits[number]) => rows.map((r) => `[${when(r.ts)}] ${r.chat_name} | ${r.sender}: ${clip(r.body)}`).join('\n');
       const none = `No matches. If you were looking for something a particular person said, they may be saved only as a number. ${NAME_HINT}`;
