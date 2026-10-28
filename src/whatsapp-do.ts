@@ -309,6 +309,7 @@ export class WhatsAppStore extends DurableObject<Env> {
   // ---------- queries (all read-only) ----------
 
   listChats(query: string | undefined, limit: number) { return this.store.listChats(query, limit); }
+  listRecentChats(query: string | undefined, limit: number, since: number) { return this.store.listRecentChats(query, limit, since); }
   resolveChat(ref: string) { return this.store.resolveChat(ref); }
   getMessages(o: Parameters<Store['getMessages']>[0]) { return this.store.getMessages(o); }
   listVoiceNotes(o: Parameters<Store['listVoiceNotes']>[0]) { return this.store.listVoiceNotes(o); }
