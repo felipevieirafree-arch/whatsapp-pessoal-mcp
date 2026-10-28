@@ -102,6 +102,32 @@ function buildServer(wa: DurableObjectStub<WhatsAppStore>, env: Env, origin: str
   );
 
   server.registerTool(
+    'list_voice_notes',
+    {
+      description:
+        'List voice notes in a chat with message IDs and media-recovery readiness. This does not download, transcribe, or reveal private media keys. ' +
+        'Notes synced before the media-metadata upgrade may say not recoverable until WhatsApp re-sends the full metadata.',
+      inputSchema: {
+        chat: z.string().describe('Existing chat jid or unambiguous name'),
+        since: z.string().optional().describe('ISO date/time lower bound'),
+        until: z.string().optional().describe('ISO date/time upper bound'),
+        limit: z.number().int().min(1).max(100).default(30),
+      },
+      annotations: { readOnlyHint: true },
+    },
+    async ({ chat, since, until, limit }) => {
+      const note = await fresh();
+      const matches = (await wa.resolveChat(chat)) as { jid: string; name: string }[];
+      if (!matches.length) return text(note + `No chat matches "${chat}". Try list_chats.`);
+      if (matches.length > 1) return text(note + `"${chat}" matches several chats; select an exact jid:\n` + matches.map((m) => `${m.name} | ${m.jid}`).join('\n'));
+      const rows = await wa.listVoiceNotes({ chat: matches[0].jid, since: epoch(since), until: epoch(until), limit });
+      return text(note + (rows.length
+        ? rows.map((r) => `[${when(r.ts)}] ${r.id} | ${r.body} | ${r.recoverable ? 'media metadata stored' : 'media metadata unavailable'}`).join('\n')
+        : 'No voice notes found for this chat and period.'));
+    },
+  );
+
+  server.registerTool(
     'recent_messages',
     {
       description:
