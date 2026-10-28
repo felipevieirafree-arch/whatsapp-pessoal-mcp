@@ -9,7 +9,7 @@
     "deploy": "wrangler deploy",
     "deploy:local": "wrangler deploy -c wrangler.local.jsonc",
     "typecheck": "tsc --noEmit",
-    "test": "node --experimental-transform-types --no-warnings test/store.test.mts && node --experimental-transform-types --no-warnings test/usage-policy.test.mjs && node --experimental-transform-types --no-warnings test/voice-offline.test.mjs"
+    "test": "node --experimental-transform-types --no-warnings test/store.test.mts && node --experimental-transform-types --no-warnings test/usage-policy.test.mjs && node --experimental-transform-types --no-warnings test/voice-offline.test.mjs && node --experimental-transform-types --no-warnings test/voice-budget.test.mjs"
   },
   "dependencies": {
     "@cloudflare/workers-oauth-provider": "0.7.0",
