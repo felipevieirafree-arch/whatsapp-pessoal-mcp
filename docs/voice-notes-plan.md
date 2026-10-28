@@ -35,3 +35,11 @@ Do not merge this branch until phase-1 checks pass. Keep production `main` untou
 
 ## Security observation
 The upstream repository is public and holds deployment templates; review `wrangler.jsonc` and history for resource IDs, but **never** commit secrets or personal audio. No secrets are required in this branch.
+
+## Zero-spend safeguards (October 2026)
+- The user has explicitly prohibited any charge. Do not configure a paid billing tier, Workers AI billing, an external transcription API, or an overage-enabled service.
+- Auto synchronization on each MCP read is OFF by default in this branch; `sync_now` remains an explicit opt-in action. **A manual sync still consumes free-tier Cloudflare quotas.**
+- Encrypted history search scans no more than 2,000 messages in one invocation. Return an explicit partial-results notice rather than implying that the full history was searched. Narrow queries by date and chat.
+- The existing production Worker has **not** been modified, and these mitigations will have no effect until reviewed, tested and deployed.
+- Before any deployment: run `npm run typecheck` and `npm test` locally, check Cloudflare account free-plan and billing controls in the dashboard, ensure no usage-based charges can apply, and measure CPU in an isolated local runtime.
+- No audio-transcription model is enabled by this change. Audio transcription may require compute credits and an external processor; do not activate without a verified no-billing path.
