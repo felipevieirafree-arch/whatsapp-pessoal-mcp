@@ -310,6 +310,7 @@ export class WhatsAppStore extends DurableObject<Env> {
   listChats(query: string | undefined, limit: number) { return this.store.listChats(query, limit); }
   resolveChat(ref: string) { return this.store.resolveChat(ref); }
   getMessages(o: Parameters<Store['getMessages']>[0]) { return this.store.getMessages(o); }
+  listVoiceNotes(o: Parameters<Store['listVoiceNotes']>[0]) { return this.store.listVoiceNotes(o); }
   recentMessages(o: Parameters<Store['recentMessages']>[0]) { return this.store.recentMessages(o); }
   search(o: Parameters<Store['search']>[0]) { return this.store.search(o); }
   counts() { return this.store.counts(); }
