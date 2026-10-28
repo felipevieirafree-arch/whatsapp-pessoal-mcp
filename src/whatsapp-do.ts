@@ -155,7 +155,7 @@ export class WhatsAppStore extends DurableObject<Env> {
 
   // ---------- RPC for the Worker ----------
 
-  /** Everything the pairing page needs, and a heartbeat that keeps the pairing session alive. */
+  /** Pairing UI status: never scan the whole message table on a polling request. */
   pairStatus() {
     this.lastPoll = Date.now();
     let qrSvg: string | null = null;
@@ -170,11 +170,11 @@ export class WhatsAppStore extends DurableObject<Env> {
       phase: this.phase,
       running: Boolean(this.session),
       progress: this.historyProgress,
-      unnamed: this.session ? 0 : this.store.unnamedCount(), // counting names is wasted work while history is still arriving
+      unnamed: 0, // counting all unnamed chats on every status poll wastes free-tier reads
       qrSvg,
       pairingCode: this.pairingCode,
       ...this.standing(),
-      ...this.store.counts(),
+      ...this.store.statusCounts(),
     };
   }
 
