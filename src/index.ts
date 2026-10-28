@@ -39,6 +39,9 @@ export interface Env extends AuthEnv {
   DEFAULT_COUNTRY_CODE?: string;
   /** Opt-in only: auto-sync on read consumes Durable Object CPU and WhatsApp connection time. */
   AUTO_SYNC_ON_READ?: string;
+  /** No voice inferencing occurs unless enabled explicitly. */
+  ENABLE_VOICE_TRANSCRIPTION?: string;
+  AI?: import('./voice-media.js').SpeechProvider;
 }
 
 /** What an agent's token carries: who, and the key that opens their data. Encrypted by the OAuth library under the token. */
