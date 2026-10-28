@@ -675,10 +675,13 @@ export class Store {
    * Decrypting is the expensive part and it happens once per message however many queries ride along, so
    * agents should batch. It stops as soon as every query has `limit` hits.
    */
-  search(opts: { queries: string[]; chat?: string; since?: number; until?: number; limit: number }): { hits: SearchHit[][]; scanned: number } {
+  search(opts: { queries: string[]; chat?: string; since?: number; until?: number; limit: number }): { hits: SearchHit[][]; scanned: number; truncated: boolean } {
+    // A full scan of a large encrypted history can reset a free-tier Durable Object.
+    // Limit each request to a modest, documented window; users can narrow by chat or date.
+    const MAX_SEARCH_ROWS = 2000;
     const wants = opts.queries.map((q) => ({ terms: parseQuery(q), hits: [] as SearchHit[] }));
     const live = new Set(wants.filter((w) => w.terms.length));
-    if (!live.size) return { hits: wants.map(() => []), scanned: 0 };
+    if (!live.size) return { hits: wants.map(() => []), scanned: 0, truncated: false };
     const where: string[] = [];
     const args: (string | number)[] = [];
     if (opts.chat) { where.push(`chat = ?`); args.push(this.pj(opts.chat)); }
@@ -688,10 +691,12 @@ export class Store {
     const jidOf = new Map<string, string>();
     for (const [cid, rec] of s.chats) jidOf.set(cid, rec.jid);
     const cursor = this.sql.exec<{ id: string; chat: string; ts: number; from_me: number; sender: string | null; data: ArrayBuffer }>(
-      `SELECT id, chat, ts, from_me, sender, data FROM messages ${where.length ? `WHERE ${where.join(' AND ')}` : ''} ORDER BY ts DESC`, ...args,
+      `SELECT id, chat, ts, from_me, sender, data FROM messages ${where.length ? `WHERE ${where.join(' AND ')}` : ''} ORDER BY ts DESC LIMIT ?`,
+      ...args, MAX_SEARCH_ROWS + 1,
     );
-    let scanned = 0;
+    let scanned = 0, truncated = false;
     for (const row of cursor) {
+      if (scanned >= MAX_SEARCH_ROWS) { truncated = true; break; }
       scanned++;
       const blob = this.vault.open<MsgBlob>(row.data, MSG);
       for (const w of live) {
@@ -702,6 +707,6 @@ export class Store {
       }
       if (!live.size) break;
     }
-    return { hits: wants.map((w) => w.hits), scanned };
+    return { hits: wants.map((w) => w.hits), scanned, truncated };
   }
 }
