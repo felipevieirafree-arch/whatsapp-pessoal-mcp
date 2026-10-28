@@ -1,0 +1,41 @@
+name: WhatsApp MCP | checks only
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [feat/voice-notes-transcription]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: whatsapp-mcp-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    name: TypeScript and offline tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    env:
+      CI: "true"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22.16.0"
+          cache: npm
+      - name: Install locked dependencies
+        run: npm ci --no-audit --no-fund
+      - name: Typecheck
+        run: npm run typecheck
+      - name: Offline tests
+        run: npm test
+      - name: Local-only Worker bundle check
+        run: npx wrangler deploy --dry-run --outdir /tmp/whatsapp-mcp-dry-run
+
+# No Cloudflare credential, no deployments, no writes to WhatsApp, and no paid service.
