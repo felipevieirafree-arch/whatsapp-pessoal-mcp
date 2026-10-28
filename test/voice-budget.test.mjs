@@ -1,0 +1,16 @@
+import assert from 'node:assert/strict';
+import { utcDay, estimatedNeurons, reserveAudioBudget, DAILY_AUDIO_NEURON_BUDGET } from '../src/voice-budget.ts';
+const now=Date.parse('2026-10-28T12:00:00Z');
+assert.equal(utcDay(now),'2026-10-28');
+assert.throws(()=>estimatedNeurons(0),/duration/);
+assert.throws(()=>estimatedNeurons(121),/duration/);
+assert.ok(estimatedNeurons(60)>46);
+let budget=null;
+for(let i=0;i<6;i++) budget=reserveAudioBudget(budget,60,now);
+assert.equal(budget.calls,6);
+assert.ok(budget.estimatedNeurons<=DAILY_AUDIO_NEURON_BUDGET);
+assert.throws(()=>reserveAudioBudget(budget,1,now),/exhausted/);
+const tomorrow=reserveAudioBudget(budget,30,now+24*3600*1000);
+assert.equal(tomorrow.calls,1);
+assert.equal(tomorrow.day,'2026-10-29');
+console.log('Local AI-budget assertions passed; no cloud service called');
