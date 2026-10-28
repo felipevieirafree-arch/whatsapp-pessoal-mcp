@@ -18,6 +18,7 @@ import type { WASocket } from '@whiskeysockets/baileys';
 import qrcode from 'qrcode-generator';
 import { sqliteAuthState } from './auth-state.js';
 import { Store, initSchema, isLegacy, migrateLegacy } from './store.js';
+import { recoverVoice, recognizeVoice } from './voice-media.js';
 import { Vault } from './vault.js';
 import { limitsOf, verdict } from './limits.js';
 import { contactText, xHandle } from './ui.js';
@@ -311,6 +312,16 @@ export class WhatsAppStore extends DurableObject<Env> {
   resolveChat(ref: string) { return this.store.resolveChat(ref); }
   getMessages(o: Parameters<Store['getMessages']>[0]) { return this.store.getMessages(o); }
   listVoiceNotes(o: Parameters<Store['listVoiceNotes']>[0]) { return this.store.listVoiceNotes(o); }
+  /** Disabled by default: no Workers AI inference or media download without an explicit env switch. */
+  async transcribeVoiceNote(chat: string, id: string): Promise<string> {
+    if (this.env.ENABLE_VOICE_TRANSCRIPTION !== 'true') throw new Error('Audio transcription disabled: zero-spend policy.');
+    if (!this.env.AI) throw new Error('No AI binding configured.');
+    const ref = this.store.getVoiceNote(chat, id);
+    if (!ref) throw new Error('No recoverable voice metadata for this message.');
+    if (this.session) await this.session;
+    const audio = await recoverVoice(ref);
+    return recognizeVoice(audio, this.env.AI);
+  }
   recentMessages(o: Parameters<Store['recentMessages']>[0]) { return this.store.recentMessages(o); }
   search(o: Parameters<Store['search']>[0]) { return this.store.search(o); }
   counts() { return this.store.counts(); }
