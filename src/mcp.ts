@@ -132,6 +132,25 @@ function buildServer(wa: DurableObjectStub<WhatsAppStore>, env: Env, origin: str
   );
 
   server.registerTool(
+    'transcribe_voice_note',
+    {
+      description: 'Transcribe an identified voice note only if the account owner explicitly enabled the zero-spend-safe audio backend. Disabled by default; do not try repeatedly if disabled.',
+      inputSchema: {
+        chat: z.string().describe('Exact existing chat JID'),
+        message_id: z.string().min(1).max(256).describe('Message ID from list_voice_notes'),
+      },
+      annotations: { readOnlyHint: true },
+    },
+    async ({ chat, message_id }) => {
+      if (env.ENABLE_VOICE_TRANSCRIPTION !== 'true') return text('Transcription is disabled to protect the zero-spend policy. No audio or AI operation was performed.');
+      const matches = await wa.resolveChat(chat);
+      if (matches.length !== 1 || matches[0].jid !== chat) return text('Provide an exact, known chat JID.');
+      try { return text(await wa.transcribeVoiceNote(chat, message_id)); }
+      catch (e: any) { return text('Voice transcription unavailable: ' + (e?.message ?? 'unknown error')); }
+    },
+  );
+
+  server.registerTool(
     'recent_messages',
     {
       description:
