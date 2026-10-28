@@ -18,6 +18,8 @@ import type { WASocket } from '@whiskeysockets/baileys';
 import qrcode from 'qrcode-generator';
 import { sqliteAuthState } from './auth-state.js';
 import { Store, initSchema, isLegacy, migrateLegacy } from './store.js';
+import { recoverVoice, recognizeVoice } from './voice-media.js';
+import { reserveAudioBudget, type DailyAudioUsage } from './voice-budget.js';
 import { Vault } from './vault.js';
 import { limitsOf, verdict } from './limits.js';
 import { contactText, xHandle } from './ui.js';
@@ -154,7 +156,7 @@ export class WhatsAppStore extends DurableObject<Env> {
 
   // ---------- RPC for the Worker ----------
 
-  /** Everything the pairing page needs, and a heartbeat that keeps the pairing session alive. */
+  /** Pairing UI status: never scan the whole message table on a polling request. */
   pairStatus() {
     this.lastPoll = Date.now();
     let qrSvg: string | null = null;
@@ -169,11 +171,11 @@ export class WhatsAppStore extends DurableObject<Env> {
       phase: this.phase,
       running: Boolean(this.session),
       progress: this.historyProgress,
-      unnamed: this.session ? 0 : this.store.unnamedCount(), // counting names is wasted work while history is still arriving
+      unnamed: 0, // counting all unnamed chats on every status poll wastes free-tier reads
       qrSvg,
       pairingCode: this.pairingCode,
       ...this.standing(),
-      ...this.store.counts(),
+      ...this.store.statusCounts(),
     };
   }
 
@@ -308,8 +310,32 @@ export class WhatsAppStore extends DurableObject<Env> {
   // ---------- queries (all read-only) ----------
 
   listChats(query: string | undefined, limit: number) { return this.store.listChats(query, limit); }
+  listRecentChats(query: string | undefined, limit: number, since: number) { return this.store.listRecentChats(query, limit, since); }
   resolveChat(ref: string) { return this.store.resolveChat(ref); }
   getMessages(o: Parameters<Store['getMessages']>[0]) { return this.store.getMessages(o); }
+  listVoiceNotes(o: Parameters<Store['listVoiceNotes']>[0]) { return this.store.listVoiceNotes(o); }
+  /** Disabled by default: no Workers AI inference or media download without an explicit env switch. */
+  async transcribeVoiceNote(chat: string, id: string): Promise<string> {
+    if (this.env.ENABLE_VOICE_TRANSCRIPTION !== 'true') throw new Error('Audio transcription disabled: zero-spend policy.');
+    if (!this.env.AI) throw new Error('No AI binding configured.');
+    const ref = this.store.getVoiceNote(chat, id);
+    if (!ref) throw new Error('No recoverable voice metadata for this message.');
+    // The owner must explicitly opt in. Even then, a persistent UTC-day budget
+    // is reserved before any media download or Workers AI invocation.
+    const key = 'voice_ai_daily_budget_v1';
+    const raw = this.store.getMeta(key);
+    let previous: DailyAudioUsage | null = null;
+    if (raw) {
+      try { previous = JSON.parse(raw) as DailyAudioUsage; }
+      catch { throw new Error('Invalid audio budget state; transcription stopped.'); }
+    }
+    if (ref.seconds == null) throw new Error('Audio duration unknown; refusing metered inference.');
+    const next = reserveAudioBudget(previous, Number(ref.seconds), Date.now());
+    this.store.setMeta(key, JSON.stringify(next));
+    if (this.session) await this.session;
+    const audio = await recoverVoice(ref);
+    return recognizeVoice(audio, this.env.AI);
+  }
   recentMessages(o: Parameters<Store['recentMessages']>[0]) { return this.store.recentMessages(o); }
   search(o: Parameters<Store['search']>[0]) { return this.store.search(o); }
   counts() { return this.store.counts(); }

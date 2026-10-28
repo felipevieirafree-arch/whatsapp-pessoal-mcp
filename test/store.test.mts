@@ -199,6 +199,66 @@ check('it stops as soon as every query is full', early.scanned < total && early.
 check('a query of only punctuation matches nothing', store.search({ queries: ['!!!'], limit: 5 }).hits[0].length === 0);
 check('query parsing', JSON.stringify(parseQuery('a "b c" d*')) === JSON.stringify([{ tokens: ['a'], prefix: false }, { tokens: ['b', 'c'], prefix: false }, { tokens: ['d'], prefix: true }]));
 
+// ---------- voice metadata is encrypted, backfillable and deletable ----------
+{
+  const mediaDb = makeSql();
+  initSchema(mediaDb.sql);
+  const mediaStore = new Store(mediaDb.sql, (fn) => fn(), vault);
+  const jid = '972533333333@s.whatsapp.net';
+  const mediaKey = Buffer.from('secret-media-key-test').toString('base64');
+  const voiceMsg = {
+    key: { id: 'v1', remoteJid: jid, fromMe: false },
+    messageTimestamp: 2000,
+    message: { audioMessage: {
+      ptt: true, seconds: 94, mimetype: 'audio/ogg; codecs=opus',
+      mediaKey: Buffer.from('secret-media-key-test'),
+      directPath: '/v/t62.7117-24/test-private-path',
+    } },
+  } as any;
+  mediaStore.ingestMessages([voiceMsg]);
+  const listing = mediaStore.listVoiceNotes({ chat: jid, since: 1900, until: 2100, limit: 5 });
+  check('audio inventory exposes message id but never media secret', listing.length === 1 && listing[0].id === 'v1' && listing[0].recoverable === true && !JSON.stringify(listing).includes(mediaKey));
+  const ref = mediaStore.getVoiceNote(jid, 'v1');
+  check('voice media descriptor is preserved inside encrypted message', ref?.mediaKey === mediaKey && ref?.seconds === 94 && ref?.ptt === true);
+  const raw = (mediaDb.db.prepare("SELECT data FROM messages LIMIT 1").get() as any).data as Uint8Array;
+  check('voice mediaKey and path never appear in plaintext at rest', !Buffer.from(raw).toString('utf8').includes('secret-media-key-test') && !Buffer.from(raw).toString('utf8').includes('test-private-path'));
+  check('normal message output never exposes media key', !(JSON.stringify(mediaStore.getMessages({ chat: jid, limit: 5 }))).includes(mediaKey));
+  const legacyMsg = { ...voiceMsg, key: { ...voiceMsg.key, id: 'v2' },
+    message: { audioMessage: { ptt: true, seconds: 25 } } };
+  mediaStore.ingestMessages([legacyMsg]);
+  check('prior audio without media key has no recoverable descriptor', mediaStore.getVoiceNote(jid, 'v2') === null);
+  mediaStore.ingestMessages([{ ...voiceMsg, key: { ...voiceMsg.key, id: 'v2' } }]);
+  check('re-import can backfill voice metadata', mediaStore.getVoiceNote(jid, 'v2')?.mediaKey === mediaKey);
+  mediaStore.ingestMessages([{ key: { id: 'del-v1', remoteJid: jid, fromMe: false },
+    messageTimestamp: 2010, message: { protocolMessage: { key: { id: 'v1' }, type: 0 } } } as any]);
+  check('deleted voice note loses recoverable metadata', mediaStore.getVoiceNote(jid, 'v1') === null);
+}
+
+// ---------- pairing totals are cached, not re-scanned per poll ----------
+{
+  const first = store.statusCounts();
+  const second = store.statusCounts();
+  check('pairing totals cached within interval', first === second);
+  check('pairing totals match stored messages', first.messages === store.counts().messages);
+}
+
+// ---------- recent-first inbox avoids full-history grouping ----------
+{
+  const recent = store.listRecentChats(undefined, 20, ts0);
+  check('recent inbox uses date filter', recent.some((r) => r.jid === GILAD));
+  check('future-only inbox is empty', store.listRecentChats(undefined, 20, ts0 + 10_000).length === 0);
+  check('recent inbox respects result limit', store.listRecentChats(undefined, 1, 0).length <= 1);
+  check('old contacts remain resolvable without scanning history', store.resolveChat('Gilad')[0]?.jid === GILAD);
+  check('unknown explicit chat cannot bypass known-history matching', store.resolveChat('000000@s.whatsapp.net').length === 0);
+}
+
+// ---------- bounded search protects free-tier CPU ----------
+{
+  const limited = store.search({ queries: ['phrase-not-in-store-xyz'], limit: 10 });
+  check('bounded search response includes truncation flag', typeof limited.truncated === 'boolean');
+  check('bounded search cannot scan over 2000 messages', limited.scanned <= 2000);
+}
+
 // ---------- nothing readable at rest ----------
 
 const allBytes = () => {

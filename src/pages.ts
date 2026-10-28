@@ -76,7 +76,7 @@ export function pairPage(token: string, req: string | null) {
 // No template literals in here on purpose: this is plain browser JS embedded in a TS template string.
 const PAIR_JS = `
 var app = document.getElementById('app');
-var mode = 'qr', view = '', redirecting = false, shownCode = null;
+var mode = 'qr', view = '', redirecting = false, shownCode = null, consecutiveErrors = 0;
 var tickIcon = '<svg class="tick" width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 6 9 17l-5-5"/></svg>';
 
 function post(path, body) {
@@ -204,21 +204,31 @@ function finish() {
 }
 
 function tick() {
+  // A setup tab must not exhaust the Durable Object SQLite read quota while idle.
+  if (document.hidden) { setTimeout(tick, 30000); return; }
   get('/pair/status').then(function (s) {
-    if (s.rejected) rejectedScreen(s);
-    else if (s.paired && s.running) importScreen(s);
-    else if (s.paired) doneScreen(s);
+    consecutiveErrors = 0;
+    if (s.rejected) { rejectedScreen(s); return; }
+    if (s.paired && !s.running) { doneScreen(s); return; } // terminal state: stop polling
+    if (s.paired && s.running) importScreen(s);
     else {
       if (mode === 'qr') { qrScreen(); var q = el('qr'); if (q && s.qrSvg) q.innerHTML = s.qrSvg; }
       else codeScreen();
     }
-    setTimeout(tick, 1500);
+    setTimeout(tick, 5000);
   }).catch(function (e) {
     if (e.message === 'expired') {
       app.innerHTML = '<h1>Session expired</h1><p>Sign in again to continue.</p><a class="button" href="/setup">Sign in</a>';
-    } else { setTimeout(tick, 3000); }
+    } else if (++consecutiveErrors >= 3) {
+      app.innerHTML = '<h1>Status temporarily unavailable</h1><p>Automatic retries have stopped to protect the free usage limit.</p>' +
+        '<button class="primary" id="retry" type="button">Retry once</button>';
+      el('retry').onclick = function () { consecutiveErrors = 0; tick(); };
+    } else { setTimeout(tick, 10000 * consecutiveErrors); }
   });
 }
 
-post('/pair/start').then(tick);
+post('/pair/start').then(tick).catch(function () {
+  app.innerHTML = '<h1>Could not start pairing</h1><p>Automatic retries are disabled to protect the free usage limit.</p>' +
+    '<a class="button" href="/setup">Try again manually</a>';
+});
 `;

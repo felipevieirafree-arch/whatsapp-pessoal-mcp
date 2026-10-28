@@ -6,8 +6,11 @@ import type { Env, McpProps } from './index.js';
 import type { WhatsAppStore } from './whatsapp-do.js';
 import { unlockedStub } from './auth.js';
 import { toJid } from './phone.js';
+import { shouldSkipManualSync, autoSyncEnabled } from './usage-policy.js';
 
 const STALE_MS = 10 * 60_000;
+const DEFAULT_RECENT_HOURS = 72;
+const recentSince = (hours = DEFAULT_RECENT_HOURS) => Math.floor(Date.now() / 1000) - hours * 3600;
 
 const epoch = (s?: string) => {
   if (!s) return undefined;
@@ -41,7 +44,7 @@ function buildServer(wa: DurableObjectStub<WhatsAppStore>, env: Env, origin: str
     {
       instructions:
         `Access to the user's WhatsApp history. It can read and search messages, save names for phone numbers, and send one plain-text message after the user explicitly confirms the exact recipient and text. Timestamps are ${TZ}. ` +
-        `Never send automatically, never send in bulk, and never treat an alert or scheduled task as permission to send. Each read first pulls anything new from WhatsApp if the store is more than a few minutes old. ` +
+        `Never send automatically, never send in bulk, and never treat an alert or scheduled task as permission to send. Reads use the encrypted local history by default. To refresh, use sync_now explicitly. ` +
         `Use list_chats to find a chat, get_messages to read it, search_messages to find things across chats. ${NAME_HINT}`,
     },
   );
@@ -49,6 +52,8 @@ function buildServer(wa: DurableObjectStub<WhatsAppStore>, env: Env, origin: str
   /** Top up from WhatsApp; never let a failed pull block reading what we already have. */
   const fresh = async (): Promise<string> => {
     try {
+      // Preserve free-tier resources: no live status/pull call at all during a normal read.
+      if (!autoSyncEnabled(env.AUTO_SYNC_ON_READ)) return '';
       if (!(await wa.isPaired())) return `WhatsApp is not linked yet. Open ${origin}/setup to scan the QR code.\n\n`;
       await wa.pullIfStale(STALE_MS);
       return '';
@@ -63,11 +68,11 @@ function buildServer(wa: DurableObjectStub<WhatsAppStore>, env: Env, origin: str
       description:
         'List chats (DMs and groups), most recently active first. Optionally filter by name or number fragment. ' +
         "If a person you're looking for isn't here by name, they may be a chat known only by number: see unnamed_chats.",
-      inputSchema: { query: z.string().optional(), limit: z.number().int().min(1).max(100).default(30) },
+      inputSchema: { query: z.string().optional(), limit: z.number().int().min(1).max(100).default(30), hours: z.number().int().min(1).max(168).default(72).describe('Recent window in hours, default 72, max 168. Old chats can be found by exact name using get_messages.') },
     },
-    async ({ query, limit }) => {
+    async ({ query, limit, hours }) => {
       const note = await fresh();
-      const rows = (await wa.listChats(query, limit)) as Rows;
+      const rows = (await wa.listRecentChats(query, limit, recentSince(hours))) as Rows;
       if (!rows.length) return text(note + `No chats found${query ? ` matching "${query}"` : ''}. ${query ? NAME_HINT : ''}`.trimEnd());
       return text(
         note + rows.map((r) => `${r.name}${r.is_group ? ' [group]' : ''} | ${r.messages} msgs | last ${when(r.last_ts)} | ${r.jid}`).join('\n'),
@@ -98,6 +103,51 @@ function buildServer(wa: DurableObjectStub<WhatsAppStore>, env: Env, origin: str
       const rows = (await wa.getMessages({ chat: matches[0].jid, limit, before: epoch(before), after: epoch(after) })) as Rows;
       const head = `# ${matches[0].name} (${rows.length} messages)\n`;
       return text(note + head + rows.map((r) => `[${when(r.ts)}] ${r.sender}: ${r.body}`).join('\n'));
+    },
+  );
+
+  server.registerTool(
+    'list_voice_notes',
+    {
+      description:
+        'List voice notes in a chat with message IDs and media-recovery readiness. This does not download, transcribe, or reveal private media keys. ' +
+        'Notes synced before the media-metadata upgrade may say not recoverable until WhatsApp re-sends the full metadata.',
+      inputSchema: {
+        chat: z.string().describe('Existing chat jid or unambiguous name'),
+        since: z.string().optional().describe('ISO date/time lower bound'),
+        until: z.string().optional().describe('ISO date/time upper bound'),
+        limit: z.number().int().min(1).max(100).default(30),
+      },
+      annotations: { readOnlyHint: true },
+    },
+    async ({ chat, since, until, limit }) => {
+      const note = await fresh();
+      const matches = (await wa.resolveChat(chat)) as { jid: string; name: string }[];
+      if (!matches.length) return text(note + `No chat matches "${chat}". Try list_chats.`);
+      if (matches.length > 1) return text(note + `"${chat}" matches several chats; select an exact jid:\n` + matches.map((m) => `${m.name} | ${m.jid}`).join('\n'));
+      const rows = await wa.listVoiceNotes({ chat: matches[0].jid, since: epoch(since), until: epoch(until), limit });
+      return text(note + (rows.length
+        ? rows.map((r) => `[${when(r.ts)}] ${r.id} | ${r.body} | ${r.recoverable ? 'media metadata stored' : 'media metadata unavailable'}`).join('\n')
+        : 'No voice notes found for this chat and period.'));
+    },
+  );
+
+  server.registerTool(
+    'transcribe_voice_note',
+    {
+      description: 'Transcribe an identified voice note only if the account owner explicitly enabled the zero-spend-safe audio backend. Disabled by default; do not try repeatedly if disabled.',
+      inputSchema: {
+        chat: z.string().describe('Exact existing chat JID'),
+        message_id: z.string().min(1).max(256).describe('Message ID from list_voice_notes'),
+      },
+      annotations: { readOnlyHint: true },
+    },
+    async ({ chat, message_id }) => {
+      if (env.ENABLE_VOICE_TRANSCRIPTION !== 'true') return text('Transcription is disabled to protect the zero-spend policy. No audio or AI operation was performed.');
+      const matches = await wa.resolveChat(chat);
+      if (matches.length !== 1 || matches[0].jid !== chat) return text('Provide an exact, known chat JID.');
+      try { return text(await wa.transcribeVoiceNote(chat, message_id)); }
+      catch (e: any) { return text('Voice transcription unavailable: ' + (e?.message ?? 'unknown error')); }
     },
   );
 
@@ -150,11 +200,15 @@ function buildServer(wa: DurableObjectStub<WhatsAppStore>, env: Env, origin: str
         if (!m.length) return text(note + `No chat matches "${chat}". ${NAME_HINT}`);
         chatJid = m[0].jid;
       }
-      const { hits } = await wa.search({ queries: qs, chat: chatJid, since: epoch(since), until: epoch(until), limit });
+      // Without a date, protect the free tier by searching only the last 72 hours.
+      // Older messages remain available by supplying an explicit 'since' or selecting a chat.
+      const from = since ? epoch(since) : recentSince();
+      const { hits, truncated } = await wa.search({ queries: qs, chat: chatJid, since: from, until: epoch(until), limit });
+      const partial = truncated ? '[Partial search: capped at 2,000 newest matching-window messages to protect free-tier CPU. Narrow by chat/date.]\n' : '';
       const lines = (rows: typeof hits[number]) => rows.map((r) => `[${when(r.ts)}] ${r.chat_name} | ${r.sender}: ${clip(r.body)}`).join('\n');
       const none = `No matches. If you were looking for something a particular person said, they may be saved only as a number. ${NAME_HINT}`;
-      if (qs.length === 1) return text(note + (hits[0].length ? lines(hits[0]) : none));
-      return text(note + qs.map((q, i) => `## ${q} (${hits[i].length} match${hits[i].length === 1 ? '' : 'es'})\n${hits[i].length ? lines(hits[i]) : 'No matches.'}`).join('\n\n'));
+      if (qs.length === 1) return text(note + partial + (hits[0].length ? lines(hits[0]) : none));
+      return text(note + partial + qs.map((q, i) => `## ${q} (${hits[i].length} match${hits[i].length === 1 ? '' : 'es'})\n${hits[i].length ? lines(hits[i]) : 'No matches.'}`).join('\n\n'));
     },
   );
 
@@ -292,7 +346,10 @@ function buildServer(wa: DurableObjectStub<WhatsAppStore>, env: Env, origin: str
       inputSchema: {},
     },
     async () => {
+      if (env.ENABLE_MANUAL_SYNC !== 'true') return text('Manual synchronization is disabled to protect Cloudflare free-tier resources. Stored messages remain readable.');
       if (!(await wa.isPaired())) return text(`WhatsApp is not linked yet. Open ${origin}/setup to scan the QR code.`);
+      const last = await wa.lastPull();
+      if (shouldSkipManualSync(last, Date.now())) return text('Manual sync skipped: last pull was less than 60 minutes ago. Existing messages remain available.');
       const r = await wa.pull();
       const c = await wa.counts();
       return text(`Pulled ${r.added} new messages in ${(r.ms / 1000).toFixed(1)}s (${r.reason}). Store now holds ${c.messages} messages across ${c.chats} chats.`);

@@ -14,7 +14,19 @@ import type { Vault } from './vault.js';
 // What each kind of blob is bound to, so one can't be swapped for another.
 const MSG = 'm', CHAT = 'c', CONTACT = 'k', NAME = 'n', ALIAS = 'l';
 
-interface MsgBlob { b: string; p?: string; s?: string }                         // body, push name, sender jid
+/** Only the encrypted media descriptor is retained. The audio bytes are never persisted. */
+export interface VoiceNoteRef {
+  url?: string;
+  directPath?: string;
+  mediaKey: string; // base64, sealed inside MsgBlob (never plaintext SQLite)
+  mimetype?: string;
+  seconds?: number;
+  fileSha256?: string;
+  fileEncSha256?: string;
+  fileLength?: string;
+  ptt: boolean;
+}
+interface MsgBlob { b: string; p?: string; s?: string; voice?: VoiceNoteRef }                         // body, push name, sender jid
 interface ChatRec { jid: string; name?: string | null; group: 0 | 1; push?: string; pushTs?: number }
 interface ContactRec { jid: string; name?: string | null; notify?: string | null }
 
@@ -227,6 +239,7 @@ interface Snapshot { chats: Map<string, ChatRec>; contacts: Map<string, ContactR
 export class Store {
   private snap: Snapshot | null = null;
   private stats: Map<string, { n: number; last: number }> | null = null;
+  private statusCache: { at: number; result: { messages: number; chats: number } } | null = null;
   private aliasMap: Map<string, string> | null = null;
 
   constructor(private sql: SqlStorage, private tx: <T>(fn: () => T) => T, private vault: Vault) {}
@@ -275,6 +288,31 @@ export class Store {
     const ct = row.sender ? s.contacts.get(row.sender) : undefined;
     const fallback = blob.s ? `+${blob.s.replace('@s.whatsapp.net', '').replace('@lid', '')}` : 'unknown';
     return real(ct?.name) ?? (row.sender ? s.customs.get(row.sender) : undefined) ?? real(ct?.notify) ?? blob.p ?? fallback;
+  }
+
+  /** Only expose a voice descriptor to the authenticated Durable Object, not to general chat tools. */
+  /** List voice notes without exposing private media keys. */
+  listVoiceNotes(opts: { chat: string; since?: number; until?: number; limit: number }) {
+    const where = ['chat = ?', "type = 'audio'"];
+    const args: (string | number)[] = [this.pj(opts.chat)];
+    if (opts.since != null) { where.push('ts >= ?'); args.push(opts.since); }
+    if (opts.until != null) { where.push('ts <= ?'); args.push(opts.until); }
+    return this.sql.exec<{ id: string; ts: number; data: ArrayBuffer }>(
+      `SELECT id, ts, data FROM messages WHERE ${where.join(' AND ')} ORDER BY ts DESC LIMIT ?`,
+      ...args, opts.limit,
+    ).toArray().map((r) => {
+      const m = this.vault.open<MsgBlob>(r.data, MSG);
+      return { id: r.id, ts: r.ts, body: m.b, recoverable: Boolean(m.voice?.mediaKey) };
+    });
+  }
+
+  getVoiceNote(chat: string, id: string): VoiceNoteRef | null {
+    const row = this.sql.exec<{ type: string; data: ArrayBuffer }>(
+      `SELECT type, data FROM messages WHERE chat = ? AND id = ?`, this.pj(chat), id,
+    ).toArray()[0];
+    if (!row || row.type !== 'audio') return null;
+    const blob = this.vault.open<MsgBlob>(row.data, MSG);
+    return blob.voice ?? null;
   }
 
   // ----- writing -----
@@ -328,6 +366,7 @@ export class Store {
     if (!r) return;
     const blob = this.vault.open<MsgBlob>(r.data, MSG);
     blob.b = body;
+    if (type === 'deleted') delete blob.voice;
     this.sql.exec(`UPDATE messages SET data = ?${type ? ', type = ?' : ''} WHERE chat = ? AND id = ?`, ...[this.vault.seal(blob, MSG), ...(type ? [type] : []), cid, id]);
   }
 
@@ -396,6 +435,22 @@ export class Store {
         }
         const d = describe(msg);
         if (!d) continue;
+        // Preserve recoverable WhatsApp media metadata within the *already encrypted* message blob.
+        // Existing message rows that were imported before this feature may be backfilled by history sync.
+        const audio = normalizeMessageContent(msg.message)?.audioMessage;
+        const voice: VoiceNoteRef | undefined = d.type === 'audio' && audio?.mediaKey?.length
+          ? {
+              ...(audio.url ? { url: audio.url } : {}),
+              ...(audio.directPath ? { directPath: audio.directPath } : {}),
+              mediaKey: Buffer.from(audio.mediaKey).toString('base64'),
+              ...(audio.mimetype ? { mimetype: audio.mimetype } : {}),
+              ...(audio.seconds != null ? { seconds: num(audio.seconds) } : {}),
+              ...(audio.fileSha256?.length ? { fileSha256: Buffer.from(audio.fileSha256).toString('base64') } : {}),
+              ...(audio.fileEncSha256?.length ? { fileEncSha256: Buffer.from(audio.fileEncSha256).toString('base64') } : {}),
+              ...(audio.fileLength != null ? { fileLength: String(audio.fileLength) } : {}),
+              ptt: Boolean(audio.ptt),
+            }
+          : undefined;
         const isGroup = chat.endsWith('@g.us');
         const senderJid = key.fromMe
           ? 'me'
@@ -408,7 +463,7 @@ export class Store {
 
         const existing = this.sql.exec<{ sender: string | null; data: ArrayBuffer }>(`SELECT sender, data FROM messages WHERE chat = ? AND id = ?`, cid, key.id).toArray()[0];
         if (!existing) {
-          const blob: MsgBlob = { b: d.body };
+          const blob: MsgBlob = { b: d.body, ...(voice ? { voice } : {}) };
           if (msg.pushName) blob.p = msg.pushName;
           if (senderJid && senderJid !== 'me') blob.s = senderJid;
           this.sql.exec(
@@ -416,14 +471,16 @@ export class Store {
             key.id, cid, ts, key.fromMe ? 1 : 0, sender, d.type, this.vault.seal(blob, MSG),
           );
           added++;
-        } else if (existing.sender == null || msg.pushName) {
-          // a repeat delivery can still fill in who sent it, or their push name
+        } else if (existing.sender == null || msg.pushName || voice) {
+          // A repeat delivery may fill missing names or backfill previously discarded media metadata.
           const blob = this.vault.open<MsgBlob>(existing.data, MSG);
           const fillPush = !blob.p && msg.pushName;
           const fillSender = existing.sender == null && sender;
-          if (fillPush || fillSender) {
+          const fillVoice = Boolean(voice && !blob.voice && d.type === 'audio');
+          if (fillPush || fillSender || fillVoice) {
             if (fillPush) blob.p = msg.pushName!;
             if (fillSender && senderJid && senderJid !== 'me') blob.s = senderJid;
+            if (fillVoice) blob.voice = voice;
             this.sql.exec(`UPDATE messages SET sender = COALESCE(sender, ?), data = ? WHERE chat = ? AND id = ?`, sender, this.vault.seal(blob, MSG), cid, key.id);
           }
         }
@@ -509,6 +566,15 @@ export class Store {
     return this.sql.exec<{ v: string }>(`SELECT v FROM meta WHERE k = ?`, k).toArray()[0]?.v ?? null;
   }
 
+  /** Cache status totals briefly: one tab used to trigger costly distinct/group SQL every 1.5s. */
+  statusCounts() {
+    const now = Date.now();
+    if (this.statusCache && now - this.statusCache.at < 60_000) return this.statusCache.result;
+    const result = this.counts();
+    this.statusCache = { at: now, result };
+    return result;
+  }
+
   counts() {
     const one = (q: string) => this.sql.exec<{ n: number }>(q).toArray()[0].n;
     return { messages: one(`SELECT COUNT(*) n FROM messages`), chats: one(`SELECT COUNT(DISTINCT chat) n FROM messages`) };
@@ -541,14 +607,23 @@ export class Store {
     return this.chatRows().filter((r) => !r.is_group && r.numberOnly).length;
   }
 
-  /** Resolve a chat reference (jid, or name/number fragment) to jids. */
+  /** Find old OR new chats by name without reading/grouping the message history. */
   resolveChat(ref: string): { jid: string; name: string }[] {
-    if (ref.includes('@')) return [{ jid: ref, name: this.chatName(ref) }];
+    const s = this.snapshot();
+    if (ref.includes('@')) {
+      const cid = this.pj(ref);
+      return s.chats.has(cid) ? [{ jid: ref, name: this.nameOf(ref, s).name }] : [];
+    }
     const q = ref.toLowerCase();
-    return this.chatRows()
-      .filter((r) => r.name.toLowerCase().includes(q) || r.jid.toLowerCase().includes(q))
-      .sort((a, b) => b.last_ts - a.last_ts).slice(0, 10)
-      .map((r) => ({ jid: r.jid, name: r.name }));
+    const matches: { jid: string; name: string }[] = [];
+    for (const r of s.chats.values()) {
+      const name = this.nameOf(r.jid, s).name;
+      if (name.toLowerCase().includes(q) || r.jid.toLowerCase().includes(q)) {
+        matches.push({ jid: r.jid, name });
+        if (matches.length >= 10) break;
+      }
+    }
+    return matches;
   }
 
   chatName(jid: string): string {
@@ -561,6 +636,26 @@ export class Store {
       .filter((r) => !q || r.name.toLowerCase().includes(q) || r.jid.toLowerCase().includes(q))
       .sort((a, b) => b.last_ts - a.last_ts).slice(0, limit)
       .map(({ jid, name, is_group, messages, last_ts }) => ({ jid, name, is_group, messages, last_ts }));
+  }
+
+  /** Daily-use inbox: scan only recently dated rows, never the full 55k+ encrypted history. */
+  listRecentChats(query: string | undefined, limit: number, since: number) {
+    const s = this.snapshot();
+    const q = query?.toLowerCase();
+    const rows = this.sql.exec<{ chat: string; n: number; last: number }>(
+      `SELECT chat, COUNT(*) AS n, MAX(ts) AS last FROM messages INDEXED BY messages_ts
+       WHERE ts >= ? GROUP BY chat ORDER BY last DESC LIMIT ?`, since, 1000,
+    ).toArray();
+    const out: { jid: string; name: string; is_group: number; messages: number; last_ts: number }[] = [];
+    for (const r of rows) {
+      const rec = s.chats.get(r.chat);
+      if (!rec) continue;
+      const name = this.nameOf(rec.jid, s).name;
+      if (q && !name.toLowerCase().includes(q) && !rec.jid.toLowerCase().includes(q)) continue;
+      out.push({ jid: rec.jid, name, is_group: rec.group, messages: r.n, last_ts: r.last });
+      if (out.length >= limit) break;
+    }
+    return out;
   }
 
   recentMessages(opts: { since?: number; limit: number }) {
@@ -619,10 +714,13 @@ export class Store {
    * Decrypting is the expensive part and it happens once per message however many queries ride along, so
    * agents should batch. It stops as soon as every query has `limit` hits.
    */
-  search(opts: { queries: string[]; chat?: string; since?: number; until?: number; limit: number }): { hits: SearchHit[][]; scanned: number } {
+  search(opts: { queries: string[]; chat?: string; since?: number; until?: number; limit: number }): { hits: SearchHit[][]; scanned: number; truncated: boolean } {
+    // A full scan of a large encrypted history can reset a free-tier Durable Object.
+    // Limit each request to a modest, documented window; users can narrow by chat or date.
+    const MAX_SEARCH_ROWS = 2000;
     const wants = opts.queries.map((q) => ({ terms: parseQuery(q), hits: [] as SearchHit[] }));
     const live = new Set(wants.filter((w) => w.terms.length));
-    if (!live.size) return { hits: wants.map(() => []), scanned: 0 };
+    if (!live.size) return { hits: wants.map(() => []), scanned: 0, truncated: false };
     const where: string[] = [];
     const args: (string | number)[] = [];
     if (opts.chat) { where.push(`chat = ?`); args.push(this.pj(opts.chat)); }
@@ -632,10 +730,12 @@ export class Store {
     const jidOf = new Map<string, string>();
     for (const [cid, rec] of s.chats) jidOf.set(cid, rec.jid);
     const cursor = this.sql.exec<{ id: string; chat: string; ts: number; from_me: number; sender: string | null; data: ArrayBuffer }>(
-      `SELECT id, chat, ts, from_me, sender, data FROM messages ${where.length ? `WHERE ${where.join(' AND ')}` : ''} ORDER BY ts DESC`, ...args,
+      `SELECT id, chat, ts, from_me, sender, data FROM messages ${where.length ? `WHERE ${where.join(' AND ')}` : ''} ORDER BY ts DESC LIMIT ?`,
+      ...args, MAX_SEARCH_ROWS + 1,
     );
-    let scanned = 0;
+    let scanned = 0, truncated = false;
     for (const row of cursor) {
+      if (scanned >= MAX_SEARCH_ROWS) { truncated = true; break; }
       scanned++;
       const blob = this.vault.open<MsgBlob>(row.data, MSG);
       for (const w of live) {
@@ -646,6 +746,6 @@ export class Store {
       }
       if (!live.size) break;
     }
-    return { hits: wants.map((w) => w.hits), scanned };
+    return { hits: wants.map((w) => w.hits), scanned, truncated };
   }
 }

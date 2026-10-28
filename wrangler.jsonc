@@ -28,6 +28,25 @@
   // Free-plan settings for this personal deployment.
   "vars": { "TIMEZONE": "America/Sao_Paulo", "DEFAULT_COUNTRY_CODE": "55" },
 
+  // Worker Preview is isolated from production state and OAuth tokens.
+  // This KV namespace was created specifically for validation; never bind production OAuth KV here.
+  "previews": {
+    "vars": {
+      "TIMEZONE": "America/Sao_Paulo",
+      "DEFAULT_COUNTRY_CODE": "55",
+      "AUTO_SYNC_ON_READ": "false",
+      "ENABLE_MANUAL_SYNC": "false",
+      "ENABLE_VOICE_TRANSCRIPTION": "false"
+    },
+    "kv_namespaces": [{ "binding": "OAUTH_KV", "id": "bbf9e3b1c9224bc2accf6eb878ff3c3e" }],
+    "durable_objects": {
+      "bindings": [
+        { "name": "WA", "class_name": "WhatsAppStore" },
+        { "name": "REGISTRY", "class_name": "Registry" }
+      ]
+    }
+  },
+
   // There is no daily pull: messages are encrypted with a key that exists only while someone is signed in,
   // so syncing happens when an agent asks (see "Things to know" in the README).
 
