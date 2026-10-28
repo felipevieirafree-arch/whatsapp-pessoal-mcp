@@ -234,6 +234,13 @@ check('query parsing', JSON.stringify(parseQuery('a "b c" d*')) === JSON.stringi
   check('deleted voice note loses recoverable metadata', mediaStore.getVoiceNote(jid, 'v1') === null);
 }
 
+// ---------- bounded search protects free-tier CPU ----------
+{
+  const limited = store.search({ queries: ['phrase-not-in-store-xyz'], limit: 10 });
+  check('bounded search response includes truncation flag', typeof limited.truncated === 'boolean');
+  check('bounded search cannot scan over 2000 messages', limited.scanned <= 2000);
+}
+
 // ---------- nothing readable at rest ----------
 
 const allBytes = () => {
