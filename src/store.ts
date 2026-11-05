@@ -29,11 +29,68 @@ function createTables(sql: SqlStorage) {
     );
     CREATE INDEX IF NOT EXISTS messages_chat_ts ON messages (chat, ts);
     CREATE INDEX IF NOT EXISTS messages_ts ON messages (ts);
+    CREATE TABLE IF NOT EXISTS chat_stats (
+      chat TEXT PRIMARY KEY, n INTEGER NOT NULL, last INTEGER NOT NULL
+    );
     CREATE TABLE IF NOT EXISTS chats (cid TEXT PRIMARY KEY, data BLOB NOT NULL);
     CREATE TABLE IF NOT EXISTS contacts (cid TEXT PRIMARY KEY, data BLOB NOT NULL);
     CREATE TABLE IF NOT EXISTS custom_names (cid TEXT PRIMARY KEY, data BLOB NOT NULL);
     CREATE TABLE IF NOT EXISTS alias (cid TEXT PRIMARY KEY, data BLOB NOT NULL);
     CREATE TABLE IF NOT EXISTS auth (k TEXT PRIMARY KEY, data BLOB NOT NULL);
+  `);
+}
+
+/**
+ * Keep chat counts and last-message timestamps in a small materialized table.
+ *
+ * listChats(), counts() and linkInfo() used to GROUP/COUNT the entire messages
+ * table. On a personal history with tens of thousands of rows, a few scheduled
+ * checks could exhaust Cloudflare Durable Objects' daily free-tier row-read
+ * allowance. The triggers make those read paths proportional to the number of
+ * chats instead of the number of messages.
+ *
+ * Existing databases are backfilled once. The marker is written only after the
+ * backfill succeeds, so an interrupted upgrade safely retries.
+ */
+export function ensureChatStats(sql: SqlStorage) {
+  sql.exec(`
+    CREATE TABLE IF NOT EXISTS chat_stats (
+      chat TEXT PRIMARY KEY, n INTEGER NOT NULL, last INTEGER NOT NULL
+    );
+    CREATE TRIGGER IF NOT EXISTS messages_stats_ai AFTER INSERT ON messages BEGIN
+      INSERT INTO chat_stats (chat, n, last) VALUES (NEW.chat, 1, NEW.ts)
+      ON CONFLICT(chat) DO UPDATE SET n = n + 1, last = MAX(last, NEW.ts);
+    END;
+    CREATE TRIGGER IF NOT EXISTS messages_stats_ad AFTER DELETE ON messages BEGIN
+      UPDATE chat_stats
+      SET n = n - 1,
+          last = CASE
+            WHEN OLD.ts >= last THEN COALESCE((SELECT MAX(ts) FROM messages WHERE chat = OLD.chat), 0)
+            ELSE last
+          END
+      WHERE chat = OLD.chat;
+      DELETE FROM chat_stats WHERE chat = OLD.chat AND n <= 0;
+    END;
+    CREATE TRIGGER IF NOT EXISTS messages_stats_au AFTER UPDATE OF chat, ts ON messages BEGIN
+      UPDATE chat_stats
+      SET n = n - 1,
+          last = CASE
+            WHEN OLD.ts >= last THEN COALESCE((SELECT MAX(ts) FROM messages WHERE chat = OLD.chat), 0)
+            ELSE last
+          END
+      WHERE chat = OLD.chat;
+      DELETE FROM chat_stats WHERE chat = OLD.chat AND n <= 0;
+      INSERT INTO chat_stats (chat, n, last) VALUES (NEW.chat, 1, NEW.ts)
+      ON CONFLICT(chat) DO UPDATE SET n = n + 1, last = MAX(last, NEW.ts);
+    END;
+  `);
+  const ready = sql.exec(`SELECT 1 FROM meta WHERE k = 'chat_stats_v1'`).toArray().length > 0;
+  if (ready) return;
+  sql.exec(`
+    DELETE FROM chat_stats;
+    INSERT INTO chat_stats (chat, n, last)
+      SELECT chat, COUNT(*), MAX(ts) FROM messages GROUP BY chat;
+    INSERT OR REPLACE INTO meta (k, v) VALUES ('chat_stats_v1', '1');
   `);
 }
 
@@ -249,7 +306,7 @@ export class Store {
   private chatStats() {
     if (this.stats) return this.stats;
     const m = new Map<string, { n: number; last: number }>();
-    for (const r of this.sql.exec<{ chat: string; n: number; last: number }>(`SELECT chat, COUNT(*) AS n, MAX(ts) AS last FROM messages GROUP BY chat`).toArray()) m.set(r.chat, { n: r.n, last: r.last });
+    for (const r of this.sql.exec<{ chat: string; n: number; last: number }>(`SELECT chat, n, last FROM chat_stats`).toArray()) m.set(r.chat, { n: r.n, last: r.last });
     return (this.stats = m);
   }
 
@@ -353,7 +410,10 @@ export class Store {
     if (r.push) blob.p = r.push;
     if (!r.fromMe && r.senderJid) blob.s = r.senderJid;
     this.sql.exec(
-      `INSERT OR REPLACE INTO messages (id, chat, ts, from_me, sender, type, data) VALUES (?,?,?,?,?,?,?)`,
+      `INSERT INTO messages (id, chat, ts, from_me, sender, type, data) VALUES (?,?,?,?,?,?,?)
+       ON CONFLICT(chat, id) DO UPDATE SET
+         ts = excluded.ts, from_me = excluded.from_me, sender = excluded.sender,
+         type = excluded.type, data = excluded.data`,
       id, cid, r.ts, r.fromMe ? 1 : 0, sender, 'reaction', this.vault.seal(blob, MSG),
     );
     return old ? 0 : 1;
@@ -510,8 +570,10 @@ export class Store {
   }
 
   counts() {
-    const one = (q: string) => this.sql.exec<{ n: number }>(q).toArray()[0].n;
-    return { messages: one(`SELECT COUNT(*) n FROM messages`), chats: one(`SELECT COUNT(DISTINCT chat) n FROM messages`) };
+    const row = this.sql.exec<{ messages: number; chats: number }>(
+      `SELECT COALESCE(SUM(n), 0) AS messages, COUNT(*) AS chats FROM chat_stats`,
+    ).toArray()[0];
+    return { messages: Number(row?.messages ?? 0), chats: Number(row?.chats ?? 0) };
   }
 
   // ----- queries -----

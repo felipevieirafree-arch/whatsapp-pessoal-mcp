@@ -17,7 +17,7 @@ import { makeWASocket, DisconnectReason } from '@whiskeysockets/baileys';
 import type { WASocket } from '@whiskeysockets/baileys';
 import qrcode from 'qrcode-generator';
 import { sqliteAuthState } from './auth-state.js';
-import { Store, initSchema, isLegacy, migrateLegacy } from './store.js';
+import { Store, ensureChatStats, initSchema, isLegacy, migrateLegacy } from './store.js';
 import { Vault } from './vault.js';
 import { limitsOf, verdict } from './limits.js';
 import { contactText, xHandle } from './ui.js';
@@ -134,6 +134,7 @@ export class WhatsAppStore extends DurableObject<Env> {
     const tx = <T>(fn: () => T) => this.ctx.storage.transactionSync(fn);
     const vault = Vault.fromBase64(dek);
     if (isLegacy(sql)) migrateLegacy(sql, vault, tx);
+    ensureChatStats(sql);
     const canary = this.meta('canary');
     if (canary) {
       try { vault.open(Buffer.from(canary, 'base64'), 'canary'); } catch { throw new Error('wrong key'); }

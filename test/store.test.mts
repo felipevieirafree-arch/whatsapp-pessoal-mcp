@@ -1,6 +1,6 @@
 // Runs the real Store against node:sqlite (a stand-in for the Durable Object's SqlStorage).
 import { DatabaseSync } from 'node:sqlite';
-import { initSchema, isLegacy, migrateLegacy, parseQuery, Store } from '../src/store.ts';
+import { ensureChatStats, initSchema, isLegacy, migrateLegacy, parseQuery, Store } from '../src/store.ts';
 import { sqliteAuthState } from '../src/auth-state.ts';
 import { limitsOf, verdict } from '../src/limits.ts';
 import { createAccount, KEY_STRETCH, newToken, openAccount, rewrap, tokenId, unwrapForToken, Vault, wrapForToken } from '../src/vault.ts';
@@ -67,6 +67,7 @@ check('the stored id is not the token', tokenId(tk.token) !== tk.token && tk.id 
 
 const { db, sql } = makeSql();
 initSchema(sql);
+ensureChatStats(sql);
 const store = new Store(sql, (fn) => fn(), vault);
 
 const GILAD = '972524219320@s.whatsapp.net', STRANGER1 = '972500000001@s.whatsapp.net', STRANGER2 = '972500000002@s.whatsapp.net';
@@ -80,6 +81,7 @@ const added = store.ingestMessages([
 ]);
 check('ingest counts new messages', added === 5, added);
 check('a repeat delivery adds nothing', store.ingestMessages([M('a1', GILAD, 100, 'hi')]) === 0);
+check('materialized counts match inserted messages', JSON.stringify(store.counts()) === JSON.stringify({ messages: 5, chats: 3 }), store.counts());
 
 // WhatsApp's masked placeholder must not count as a name
 store.upsertContacts([{ id: GILAD, name: '+972∙∙∙∙∙∙∙20' }]);
@@ -135,11 +137,13 @@ check('learning the number folds the lid chat into it', !folded.some((c) => c.ji
 check('and its messages follow', (store.getMessages({ chat: LIDPN, limit: 5 }) as any[])[0]?.body === 'sent from a lid');
 store.ingestMessages([M('l2', LID, 610, 'later, still on the lid')]);
 check('later lid messages land on the number', (store.getMessages({ chat: LIDPN, limit: 5 }) as any[]).length === 2);
+check('materialized counts survive chat folding', store.counts().messages === 11, store.counts());
 
 // ---------- reactions ----------
 {
   const { sql: rsql } = makeSql();
   initSchema(rsql);
+  ensureChatStats(rsql);
   const rs = new Store(rsql, (fn) => fn(), vault);
   const DANA = '972555555555@s.whatsapp.net', GROUP = '9999@g.us';
   const R = (id: string, chat: string, ts: number, target: string, text: string, fromMe = false, extra: any = {}) =>
@@ -222,6 +226,21 @@ const stranger = new Store(sql, (fn) => fn(), other);
 check('another key cannot read the chats', throws(() => stranger.listChats(undefined, 10)));
 check('another key cannot search', throws(() => stranger.search({ queries: ['flights'], limit: 5 })));
 
+// Upgrade path: encrypted stores created before chat_stats existed have messages
+// but no materialized rows. The one-time backfill must preserve them, and a
+// repeated ensure must be harmless.
+{
+  const prior = makeSql();
+  initSchema(prior.sql);
+  const ps = new Store(prior.sql, (fn) => fn(), vault);
+  ps.ingestMessages([M('u1', GILAD, 10, 'before upgrade'), M('u2', STRANGER1, 20, 'also before upgrade')]);
+  ensureChatStats(prior.sql);
+  ensureChatStats(prior.sql);
+  check('chat_stats backfills an existing encrypted store once', JSON.stringify(ps.counts()) === JSON.stringify({ messages: 2, chats: 2 }), ps.counts());
+  ps.ingestMessages([M('u3', GILAD, 30, 'after upgrade')]);
+  check('chat_stats stays incremental after backfill', JSON.stringify(ps.counts()) === JSON.stringify({ messages: 3, chats: 2 }), ps.counts());
+}
+
 // ---------- auth state ----------
 
 const authDb = makeSql();
@@ -269,6 +288,7 @@ check('(control) the leak detector does find plaintext in an unmigrated database
 check('an old plaintext database is detected and left alone', isLegacy(old.sql) && !!(old.db.prepare(`SELECT 1 FROM sqlite_master WHERE name='messages' AND sql LIKE '%body%'`).get()));
 check('the stored Google credential is deleted', !old.db.prepare(`SELECT 1 FROM meta WHERE k='google_refresh'`).get());
 migrateLegacy(old.sql, vault, (fn) => fn());
+ensureChatStats(old.sql);
 check('after migrating it is no longer legacy', !isLegacy(old.sql));
 check('no legacy tables are left', !old.db.prepare(`SELECT 1 FROM sqlite_master WHERE name LIKE 'legacy_%' OR name='google_contacts' OR name LIKE '%fts%'`).get());
 const up = new Store(old.sql, (fn) => fn(), vault);
